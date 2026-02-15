@@ -66,6 +66,66 @@ Optional: download all MioTTS LLM models from `Aratako/MioTTS-GGUF`:
 
 That's it! Open `output.wav` in any audio player.
 
+## Streaming
+
+Build streaming tools:
+```bash
+cmake --build build --target miotts-stream-device miotts-stream-benchmark miotts-stream-compare
+```
+
+### Play directly to audio device
+
+```bash
+./build/miotts-stream-device \
+  -m models/MioTTS-0.1B-Q8_0.gguf \
+  -c models/miocodec.gguf \
+  -v models/jp_female.emb.gguf \
+  -p "こんにちは、今日はいい天気ですね。"
+```
+
+To debug playback glitches, dump exactly what was fed to the device callback:
+```bash
+./build/miotts-stream-device \
+  -m models/MioTTS-0.1B-Q8_0.gguf \
+  -c models/miocodec.gguf \
+  -v models/jp_female.emb.gguf \
+  -p "こんにちは、今日はいい天気ですね。" \
+  --dump-fed-wav fed_audio.wav
+```
+
+### Measure realtime ratio (no playback)
+
+```bash
+./build/miotts-stream-benchmark \
+  -m models/MioTTS-0.1B-Q8_0.gguf \
+  -c models/miocodec.gguf \
+  -v models/jp_female.emb.gguf \
+  -p "こんにちは、今日はいい天気ですね。"
+```
+
+It reports total processing time, generated audio duration, realtime ratio, and stage timings (`llm`, `codec`, `istft`, callback).
+
+### Compare offline vs stream-concat output
+
+```bash
+./build/miotts-stream-compare \
+  -m models/MioTTS-0.1B-Q8_0.gguf \
+  -c models/miocodec.gguf \
+  -v models/jp_female.emb.gguf \
+  -p "こんにちは、今日はいい天気ですね。" \
+  --out-offline offline.wav \
+  --out-stream stream_concat.wav
+```
+
+### Current streaming defaults
+
+Current defaults are tuned for a quality/speed balance:
+- conservative commit holdback to stabilize emitted regions
+- chunk-boundary crossfade (~30 ms)
+- reduced decode cadence to avoid excessive codec re-decodes
+
+These defaults prioritize clean playback over minimum latency.
+
 ## Options
 
 | Flag | Description | Default |
