@@ -29,14 +29,28 @@ You need three files in the `models/` directory:
 | File | What it is | Where to get it |
 |------|-----------|-----------------|
 | `MioTTS-0.1B-Q8_0.gguf` | The text-to-speech LLM | [Aratako/MioTTS-GGUF](https://huggingface.co/Aratako/MioTTS-GGUF) |
-| `miocodec.gguf` | The audio decoder | Included in this repo / see Releases |
-| `jp_female.emb.gguf` (or other voice) | Voice style | Included in this repo / see Releases |
+| `miocodec.gguf` | The audio decoder | [mnga-o/miotts-cpp-gguf](https://huggingface.co/mmnga-o/miotts-cpp-gguf) |
+| `jp_female.emb.gguf` (or other voice) | Voice style | [mnga-o/miotts-cpp-gguf](https://huggingface.co/mmnga-o/miotts-cpp-gguf) |
 
-Download the LLM model:
+For [mnga-o/miotts-cpp-gguf](https://huggingface.co/mmnga-o/miotts-cpp-gguf) gguf files, the author does not note for the license. But hopefully, it is same to the original models.
+
+Download the required models (codec + all voices + default 0.1B LLM):
 ```bash
-# Pick a size — smaller is faster, larger sounds better
-# 0.1B Q8_0 (125 MB) is a good starting point
-huggingface-cli download Aratako/MioTTS-GGUF MioTTS-0.1B-Q8_0.gguf --local-dir models/
+./scripts/download-models.sh
+```
+
+Windows PowerShell:
+```powershell
+.\scripts\download-models.ps1
+```
+
+Optional: download all MioTTS LLM models from `Aratako/MioTTS-GGUF`:
+```bash
+./scripts/download-models.sh --all-models
+```
+
+```powershell
+.\scripts\download-models.ps1 -AllModels
 ```
 
 ### 3. Generate speech
@@ -46,7 +60,7 @@ huggingface-cli download Aratako/MioTTS-GGUF MioTTS-0.1B-Q8_0.gguf --local-dir m
   -m models/MioTTS-0.1B-Q8_0.gguf \
   -c models/miocodec.gguf \
   -v models/jp_female.emb.gguf \
-  -p "Hello, this is a test." \
+  -p "ラーメン食べますか?嫌なら食べなくていいですけど、捨てるのもったいないので持って帰ってください。" \
   -o output.wav
 ```
 
@@ -79,14 +93,32 @@ Four built-in voices are included:
 
 ### Create your own voice
 
-You can create a custom voice from any audio recording (WAV, MP3, FLAC, WebM, etc.):
+You can create a custom voice from any recording (WAV, MP3, FLAC, WebM, etc.).
 
+1. Install dependencies:
 ```bash
 pip install miocodec torch torchaudio soundfile gguf
+```
+
+2. Prepare a clean speech clip.
+Use 5-30 seconds of mostly solo speech with low background noise.
+If you have a long file, trim it first (example with ffmpeg):
+```bash
+ffmpeg -i input_audio.wav -ss 00:00:05 -t 20 my_voice.wav
+```
+
+3. Generate a voice embedding file:
+```bash
 python3 tools/create_voice_emb.py my_voice.wav models/my_voice.emb.gguf
 ```
 
-A few seconds of clear speech is enough. The script extracts the speaker characteristics and saves a tiny file (~768 bytes) that you can use with `-v`.
+4. Use your new voice with `miotts`:
+```bash
+./build/miotts -m models/MioTTS-0.1B-Q8_0.gguf -c models/miocodec.gguf \
+  -v models/my_voice.emb.gguf -p "Hello from my custom voice." -o my_voice_test.wav
+```
+
+The generated `.emb.gguf` file is tiny (~768 bytes), so you can keep multiple voice presets in `models/`.
 
 ## Choosing a model size
 
@@ -132,6 +164,7 @@ With GPU acceleration (CUDA):
 ## Credits
 
 - [MioTTS](https://huggingface.co/collections/Aratako/miotts) and [MioCodec](https://huggingface.co/Aratako/MioCodec-25Hz-44.1kHz-v2) by [Aratako](https://huggingface.co/Aratako)
+- GGUF packaging used here (`miocodec.gguf` and voice `.emb.gguf` files) from [mnga-o/miotts-cpp-gguf](https://huggingface.co/mmnga-o/miotts-cpp-gguf)
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) by Georgi Gerganov
 
 ## License
