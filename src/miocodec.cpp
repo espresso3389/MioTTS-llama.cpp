@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ============================================================
@@ -50,9 +51,9 @@ struct miocodec_context {
     gguf_context  * ctx_gguf  = nullptr;
     ggml_context  * ctx_meta  = nullptr;
     weight_map      weights;
-    std::ifstream   file;
-    size_t          data_offset = 0;
     ggml_backend_t  backend = nullptr;
+    std::unordered_map<std::string, std::vector<uint8_t>> tensor_data_cache;
+    size_t tensor_data_cache_bytes = 0;
 
     // Model parameters (read from GGUF KV)
     int sample_rate   = 44100;
@@ -88,13 +89,61 @@ struct miocodec_context {
     std::vector<int> up_kernels;
 };
 
+static bool preload_all_tensor_data(miocodec_context * ctx, const std::string & model_path) {
+    std::ifstream file(model_path, std::ios::binary);
+    if (!file.is_open()) {
+        fprintf(stderr, "miocodec: failed to open %s for tensor preload\n", model_path.c_str());
+        return false;
+    }
+
+    const size_t data_offset = gguf_get_data_offset(ctx->ctx_gguf);
+    ctx->tensor_data_cache.clear();
+    ctx->tensor_data_cache_bytes = 0;
+    ctx->tensor_data_cache.reserve(ctx->weights.tensors.size());
+
+    for (const auto & kv : ctx->weights.tensors) {
+        const std::string & name = kv.first;
+        ggml_tensor * meta = kv.second;
+        if (!meta) {
+            continue;
+        }
+        const size_t nbytes = ggml_nbytes(meta);
+        if (nbytes == 0) {
+            continue;
+        }
+
+        int64_t idx = gguf_find_tensor(ctx->ctx_gguf, name.c_str());
+        if (idx < 0) {
+            fprintf(stderr, "miocodec: WARNING: tensor '%s' not found in GGUF index\n", name.c_str());
+            continue;
+        }
+
+        std::vector<uint8_t> bytes(nbytes);
+        const size_t offset = data_offset + gguf_get_tensor_offset(ctx->ctx_gguf, idx);
+        file.seekg(offset);
+        file.read(reinterpret_cast<char *>(bytes.data()), nbytes);
+        if (!file.good()) {
+            fprintf(stderr, "miocodec: failed to preload tensor '%s' (%zu bytes)\n", name.c_str(), nbytes);
+            return false;
+        }
+
+        ctx->tensor_data_cache_bytes += nbytes;
+        ctx->tensor_data_cache.emplace(name, std::move(bytes));
+    }
+
+    return true;
+}
+
 static bool read_tensor_data(miocodec_context * ctx, const std::string & name, void * dst, size_t dst_size) {
-    int64_t idx = gguf_find_tensor(ctx->ctx_gguf, name.c_str());
-    if (idx < 0) return false;
-    size_t offset = ctx->data_offset + gguf_get_tensor_offset(ctx->ctx_gguf, idx);
-    ctx->file.seekg(offset);
-    ctx->file.read(reinterpret_cast<char *>(dst), dst_size);
-    return ctx->file.good();
+    auto it = ctx->tensor_data_cache.find(name);
+    if (it == ctx->tensor_data_cache.end()) {
+        return false;
+    }
+    if (it->second.size() < dst_size) {
+        return false;
+    }
+    std::memcpy(dst, it->second.data(), dst_size);
+    return true;
 }
 
 static int gguf_get_val_u32_or(gguf_context * gctx, const char * key, int def) {
@@ -130,13 +179,18 @@ static int fill_all_weights(miocodec_context * mctx, ggml_context * ctx) {
             skipped++;
             continue;
         }
-        size_t nbytes = ggml_nbytes(t);
-        std::vector<uint8_t> tmp(nbytes);
-        if (read_tensor_data(mctx, name, tmp.data(), nbytes)) {
-            ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
+        auto it = mctx->tensor_data_cache.find(name);
+        if (it != mctx->tensor_data_cache.end()) {
+            const size_t nbytes = ggml_nbytes(t);
+            if (it->second.size() < nbytes) {
+                fprintf(stderr, "miocodec: WARNING: cached tensor '%s' too small (%zu < %zu)\n",
+                        name.c_str(), it->second.size(), nbytes);
+                continue;
+            }
+            ggml_backend_tensor_set(t, it->second.data(), 0, nbytes);
             count++;
         } else {
-            fprintf(stderr, "miocodec: WARNING: failed to read data for '%s'\n", name.c_str());
+            fprintf(stderr, "miocodec: WARNING: missing cached tensor data for '%s'\n", name.c_str());
         }
     }
     if (skipped > 0) fprintf(stderr, "miocodec: %d tensors skipped (no buffer)\n", skipped);
@@ -372,13 +426,6 @@ static ggml_tensor * snake_activation(ggml_context * ctx, ggml_tensor * x,
 miocodec_context * miocodec_load(const std::string & model_path) {
     auto * ctx = new miocodec_context();
 
-    ctx->file.open(model_path, std::ios::binary);
-    if (!ctx->file.is_open()) {
-        fprintf(stderr, "miocodec: failed to open %s\n", model_path.c_str());
-        delete ctx;
-        return nullptr;
-    }
-
     ggml_context * meta = nullptr;
     gguf_init_params params = { true, &meta };
     ctx->ctx_gguf = gguf_init_from_file(model_path.c_str(), params);
@@ -388,8 +435,13 @@ miocodec_context * miocodec_load(const std::string & model_path) {
         return nullptr;
     }
     ctx->ctx_meta = meta;
-    ctx->data_offset = gguf_get_data_offset(ctx->ctx_gguf);
     ctx->weights.load(meta);
+
+    if (!preload_all_tensor_data(ctx, model_path)) {
+        fprintf(stderr, "miocodec: tensor preload failed\n");
+        miocodec_free(ctx);
+        return nullptr;
+    }
 
     // Read model parameters from GGUF KV
     auto * g = ctx->ctx_gguf;
@@ -442,6 +494,8 @@ miocodec_context * miocodec_load(const std::string & model_path) {
     fprintf(stderr, "miocodec: %lld tensors, sr=%d, n_fft=%d, hop=%d, head=%d\n",
             (long long)gguf_get_n_tensors(ctx->ctx_gguf),
             ctx->sample_rate, ctx->n_fft, ctx->hop_length, ctx->head_out_dim);
+    fprintf(stderr, "miocodec: preloaded %.2f MiB tensor data into memory cache\n",
+            (double) ctx->tensor_data_cache_bytes / (1024.0 * 1024.0));
     fprintf(stderr, "miocodec: upsampler factors=[%d,%d] kernels=[%d,%d] total=%dx\n",
             ctx->up_factors[0], ctx->up_factors[1],
             ctx->up_kernels[0], ctx->up_kernels[1], total_up);

@@ -58,3 +58,25 @@ target_link_libraries(miotts-stream-device PRIVATE
     ggml
     m
 )
+
+add_executable(miotts-stream-benchmark
+    examples/stream-benchmark.cpp
+    src/miocodec.cpp
+    src/istft.cpp
+    src/text-normalize.cpp
+    src/test-to-speech.cpp
+    src/token-parser.cpp
+    src/wav-writer.cpp
+)
+
+target_include_directories(miotts-stream-benchmark PRIVATE
+    src
+    third_party/llama.cpp/include
+    third_party/llama.cpp/ggml/include
+)
+
+target_link_libraries(miotts-stream-benchmark PRIVATE
+    llama
+    ggml
+    m
+)

@@ -9,6 +9,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -248,7 +249,9 @@ static bool decode_codes_to_audio(miocodec_context * codec,
                                   const istft_cache & istft_ctx,
                                   const int * codes,
                                   int n_codes,
-                                  std::vector<float> & out_audio) {
+                                  std::vector<float> & out_audio,
+                                  double * out_codec_sec = nullptr,
+                                  double * out_istft_sec = nullptr) {
     if (n_codes <= 0) {
         out_audio.clear();
         return true;
@@ -256,17 +259,27 @@ static bool decode_codes_to_audio(miocodec_context * codec,
 
     int n_frames = 0;
     int audio_length = n_codes * samples_per_token;
+    const auto t_codec0 = std::chrono::steady_clock::now();
     std::vector<float> spec = miocodec_decode(
         codec, codes, n_codes, voice_emb.data(), audio_length, &n_frames);
+    const auto t_codec1 = std::chrono::steady_clock::now();
     if (spec.empty()) {
         fprintf(stderr, "TestToSpeech: codec decode failed (stream)\n");
         return false;
     }
+    if (out_codec_sec) {
+        *out_codec_sec += std::chrono::duration<double>(t_codec1 - t_codec0).count();
+    }
 
+    const auto t_istft0 = std::chrono::steady_clock::now();
     out_audio = istft(spec.data(), n_frames, hop_length, istft_ctx);
+    const auto t_istft1 = std::chrono::steady_clock::now();
     if (out_audio.empty()) {
         fprintf(stderr, "TestToSpeech: iSTFT failed (stream)\n");
         return false;
+    }
+    if (out_istft_sec) {
+        *out_istft_sec += std::chrono::duration<double>(t_istft1 - t_istft0).count();
     }
 
     float peak = 0.0f;
@@ -327,6 +340,19 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
                                      const StreamCallback & callback,
                                      size_t chunk_samples,
                                      const Options & options) {
+    StreamProfile unused_profile;
+    return synthesize_stream_profiled(voice, text, callback, chunk_samples, options, unused_profile);
+}
+
+bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
+                                              const std::string & text,
+                                              const StreamCallback & callback,
+                                              size_t chunk_samples,
+                                              const Options & options,
+                                              StreamProfile & profile) {
+    profile = StreamProfile{};
+    const auto t_total0 = std::chrono::steady_clock::now();
+
     if (!callback) {
         return false;
     }
@@ -340,7 +366,11 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
                           bool is_final) -> bool {
         if (begin >= end) {
             if (is_final) {
-                return callback(nullptr, 0, sample_rate_, true);
+                const auto t_cb0 = std::chrono::steady_clock::now();
+                const bool ok = callback(nullptr, 0, sample_rate_, true);
+                const auto t_cb1 = std::chrono::steady_clock::now();
+                profile.callback_sec += std::chrono::duration<double>(t_cb1 - t_cb0).count();
+                return ok;
             }
             return true;
         }
@@ -349,9 +379,15 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
         while (i < end) {
             const size_t n = std::min(chunk_samples, end - i);
             const bool is_last = is_final && (i + n >= end);
+            const auto t_cb0 = std::chrono::steady_clock::now();
             if (!callback(audio.data() + i, n, sample_rate_, is_last)) {
+                const auto t_cb1 = std::chrono::steady_clock::now();
+                profile.callback_sec += std::chrono::duration<double>(t_cb1 - t_cb0).count();
                 return false;
             }
+            const auto t_cb1 = std::chrono::steady_clock::now();
+            profile.callback_sec += std::chrono::duration<double>(t_cb1 - t_cb0).count();
+            profile.emitted_samples += n;
             i += n;
         }
         return true;
@@ -362,7 +398,10 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
         if (!decode_tokens_to_audio(voice, text, audio)) {
             return false;
         }
-        return emit_range(audio, 0, audio.size(), true);
+        const bool ok = emit_range(audio, 0, audio.size(), true);
+        const auto t_total1 = std::chrono::steady_clock::now();
+        profile.total_sec = std::chrono::duration<double>(t_total1 - t_total0).count();
+        return ok;
     }
 
     if (!model_ || !vocab_) {
@@ -434,9 +473,10 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
     // Streaming policy:
     // - keep a small right-side holdback so we do not emit unstable newest region
     // - decode from a lookback window for continuity at chunk boundaries
-    const int stream_check_interval = 8;
+    const int stream_check_interval = 16;
     const size_t lookback_codes = 24;
     const size_t holdback_codes = 10;
+    const size_t min_commit_step_codes = 12;
     std::string generated;
     size_t committed_codes = 0;
     int cur_pos = n_tokens;
@@ -457,6 +497,9 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
             }
             return true;
         }
+        if (!is_final && (target_committed_codes - committed_codes) < min_commit_step_codes) {
+            return true;
+        }
 
         const size_t window_start_code = committed_codes > lookback_codes
             ? committed_codes - lookback_codes
@@ -464,6 +507,8 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
         const int window_n_codes = static_cast<int>(codes.size() - window_start_code);
 
         std::vector<float> window_audio;
+        double codec_sec = 0.0;
+        double istft_sec = 0.0;
         if (!decode_codes_to_audio(codec_,
                                    voice.embedding(),
                                    samples_per_token_,
@@ -471,9 +516,15 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
                                    *istft_cache_,
                                    codes.data() + window_start_code,
                                    window_n_codes,
-                                   window_audio)) {
+                                   window_audio,
+                                   &codec_sec,
+                                   &istft_sec)) {
             return false;
         }
+        profile.codec_sec += codec_sec;
+        profile.istft_sec += istft_sec;
+        profile.decode_calls++;
+        profile.decoded_codes += (size_t) window_n_codes;
 
         const size_t begin_in_window =
             (committed_codes - window_start_code) * static_cast<size_t>(samples_per_token_);
@@ -493,6 +544,7 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
 
     bool ok = true;
     while (n_gen < max_tokens) {
+        const auto t_llm0 = std::chrono::steady_clock::now();
         llama_token new_token = llama_sampler_sample(sampler, ctx, -1);
         llama_sampler_accept(sampler, new_token);
 
@@ -518,9 +570,12 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
             ok = false;
             break;
         }
+        const auto t_llm1 = std::chrono::steady_clock::now();
+        profile.llm_sec += std::chrono::duration<double>(t_llm1 - t_llm0).count();
 
         cur_pos++;
         n_gen++;
+        profile.llm_tokens = n_gen;
 
         if ((n_gen % stream_check_interval) == 0) {
             if (!maybe_emit(false)) {
@@ -537,6 +592,8 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
     llama_batch_free(batch);
     llama_sampler_free(sampler);
     llama_free(ctx);
+    const auto t_total1 = std::chrono::steady_clock::now();
+    profile.total_sec = std::chrono::duration<double>(t_total1 - t_total0).count();
     return ok;
 }
 

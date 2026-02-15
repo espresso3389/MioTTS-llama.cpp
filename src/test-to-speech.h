@@ -25,6 +25,18 @@ private:
 
 class TestToSpeech {
 public:
+    struct StreamProfile {
+        double total_sec = 0.0;
+        double llm_sec = 0.0;
+        double codec_sec = 0.0;
+        double istft_sec = 0.0;
+        double callback_sec = 0.0;
+        int llm_tokens = 0;
+        int decode_calls = 0;
+        size_t decoded_codes = 0;
+        size_t emitted_samples = 0;
+    };
+
     struct Config {
         std::string model_path;
         std::string codec_path;
@@ -79,6 +91,12 @@ public:
                            const std::string & text,
                            const StreamCallback & callback,
                            size_t chunk_samples = 4096);
+    bool synthesize_stream_profiled(const VoiceModel & voice,
+                                    const std::string & text,
+                                    const StreamCallback & callback,
+                                    size_t chunk_samples,
+                                    const Options & options,
+                                    StreamProfile & profile);
 
 private:
     std::string run_llm(const std::string & text, const Options & options);
