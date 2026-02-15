@@ -200,7 +200,8 @@ std::string TestToSpeech::run_llm(const std::string & text, const Options & opti
 
 bool TestToSpeech::decode_tokens_to_audio(const VoiceModel & voice,
                                           const std::string & token_text,
-                                          std::vector<float> & out_audio) {
+                                          std::vector<float> & out_audio,
+                                          bool apply_peak_normalization) {
     if (!voice.is_ready()) {
         fprintf(stderr, "TestToSpeech: voice model is not ready\n");
         return false;
@@ -228,14 +229,16 @@ bool TestToSpeech::decode_tokens_to_audio(const VoiceModel & voice,
         return false;
     }
 
-    float peak = 0.0f;
-    for (float s : out_audio) {
-        peak = std::max(peak, std::abs(s));
-    }
-    if (peak > 1e-8f) {
-        float gain = 0.95f / peak;
-        for (float & s : out_audio) {
-            s *= gain;
+    if (apply_peak_normalization) {
+        float peak = 0.0f;
+        for (float s : out_audio) {
+            peak = std::max(peak, std::abs(s));
+        }
+        if (peak > 1e-8f) {
+            float gain = 0.95f / peak;
+            for (float & s : out_audio) {
+                s *= gain;
+            }
         }
     }
 
@@ -251,7 +254,8 @@ static bool decode_codes_to_audio(miocodec_context * codec,
                                   int n_codes,
                                   std::vector<float> & out_audio,
                                   double * out_codec_sec = nullptr,
-                                  double * out_istft_sec = nullptr) {
+                                  double * out_istft_sec = nullptr,
+                                  bool apply_peak_normalization = true) {
     if (n_codes <= 0) {
         out_audio.clear();
         return true;
@@ -282,14 +286,16 @@ static bool decode_codes_to_audio(miocodec_context * codec,
         *out_istft_sec += std::chrono::duration<double>(t_istft1 - t_istft0).count();
     }
 
-    float peak = 0.0f;
-    for (float s : out_audio) {
-        peak = std::max(peak, std::abs(s));
-    }
-    if (peak > 1e-8f) {
-        float gain = 0.95f / peak;
-        for (float & s : out_audio) {
-            s *= gain;
+    if (apply_peak_normalization) {
+        float peak = 0.0f;
+        for (float s : out_audio) {
+            peak = std::max(peak, std::abs(s));
+        }
+        if (peak > 1e-8f) {
+            float gain = 0.95f / peak;
+            for (float & s : out_audio) {
+                s *= gain;
+            }
         }
     }
 
@@ -306,16 +312,11 @@ bool TestToSpeech::synthesize_to_vector(const VoiceModel & voice,
     }
 
     std::string token_text;
-    if (options.skip_llm) {
-        token_text = text;
-    } else {
-        token_text = run_llm(text, options);
-        if (token_text.empty()) {
-            return false;
-        }
+    if (!generate_token_text(text, options, token_text)) {
+        return false;
     }
 
-    return decode_tokens_to_audio(voice, token_text, out_audio);
+    return decode_tokens_to_audio(voice, token_text, out_audio, options.apply_peak_normalization);
 }
 
 bool TestToSpeech::synthesize_to_file(const VoiceModel & voice,
@@ -360,6 +361,9 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
         chunk_samples = 4096;
     }
 
+    const size_t crossfade_samples = std::min<size_t>(static_cast<size_t>(sample_rate_ * 3 / 100), 4096); // ~30 ms
+    std::vector<float> crossfade_tail;
+
     auto emit_range = [&](const std::vector<float> & audio,
                           size_t begin,
                           size_t end,
@@ -376,11 +380,29 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
         }
 
         size_t i = begin;
+        bool first_chunk = true;
         while (i < end) {
             const size_t n = std::min(chunk_samples, end - i);
+            std::vector<float> out_chunk(audio.begin() + i, audio.begin() + i + n);
+
+            if (first_chunk && !crossfade_tail.empty()) {
+                const size_t xf = std::min(crossfade_tail.size(), out_chunk.size());
+                for (size_t j = 0; j < xf; ++j) {
+                    const float a = static_cast<float>(j + 1) / static_cast<float>(xf + 1);
+                    const float b = 1.0f - a;
+                    out_chunk[j] = b * crossfade_tail[j] + a * out_chunk[j];
+                }
+            }
+
+            if (n >= crossfade_samples) {
+                crossfade_tail.assign(out_chunk.end() - crossfade_samples, out_chunk.end());
+            } else {
+                crossfade_tail = out_chunk;
+            }
+
             const bool is_last = is_final && (i + n >= end);
             const auto t_cb0 = std::chrono::steady_clock::now();
-            if (!callback(audio.data() + i, n, sample_rate_, is_last)) {
+            if (!callback(out_chunk.data(), n, sample_rate_, is_last)) {
                 const auto t_cb1 = std::chrono::steady_clock::now();
                 profile.callback_sec += std::chrono::duration<double>(t_cb1 - t_cb0).count();
                 return false;
@@ -389,13 +411,14 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
             profile.callback_sec += std::chrono::duration<double>(t_cb1 - t_cb0).count();
             profile.emitted_samples += n;
             i += n;
+            first_chunk = false;
         }
         return true;
     };
 
     if (options.skip_llm) {
         std::vector<float> audio;
-        if (!decode_tokens_to_audio(voice, text, audio)) {
+        if (!decode_tokens_to_audio(voice, text, audio, false)) {
             return false;
         }
         const bool ok = emit_range(audio, 0, audio.size(), true);
@@ -473,10 +496,9 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
     // Streaming policy:
     // - keep a small right-side holdback so we do not emit unstable newest region
     // - decode from a lookback window for continuity at chunk boundaries
-    const int stream_check_interval = 16;
-    const size_t lookback_codes = 24;
-    const size_t holdback_codes = 10;
-    const size_t min_commit_step_codes = 12;
+    const int stream_check_interval = 20;
+    const size_t holdback_codes = 32;
+    const size_t min_commit_step_codes = 24;
     std::string generated;
     size_t committed_codes = 0;
     int cur_pos = n_tokens;
@@ -501,10 +523,10 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
             return true;
         }
 
-        const size_t window_start_code = committed_codes > lookback_codes
-            ? committed_codes - lookback_codes
-            : 0;
-        const int window_n_codes = static_cast<int>(codes.size() - window_start_code);
+        // Quality-first path: decode full accumulated codes so already-generated
+        // region matches non-streaming context as closely as possible.
+        const size_t window_start_code = 0;
+        const int window_n_codes = static_cast<int>(codes.size());
 
         std::vector<float> window_audio;
         double codec_sec = 0.0;
@@ -514,11 +536,12 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
                                    samples_per_token_,
                                    hop_length_,
                                    *istft_cache_,
-                                   codes.data() + window_start_code,
+                                   codes.data(),
                                    window_n_codes,
                                    window_audio,
                                    &codec_sec,
-                                   &istft_sec)) {
+                                   &istft_sec,
+                                   false)) {
             return false;
         }
         profile.codec_sec += codec_sec;
@@ -526,10 +549,15 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
         profile.decode_calls++;
         profile.decoded_codes += (size_t) window_n_codes;
 
-        const size_t begin_in_window =
-            (committed_codes - window_start_code) * static_cast<size_t>(samples_per_token_);
-        const size_t end_in_window =
-            (target_committed_codes - window_start_code) * static_cast<size_t>(samples_per_token_);
+        // Map committed-code positions to sample indices using the actual decoded
+        // window length to avoid splice drift from strict samples_per_token rounding.
+        const double samples_per_code_actual = codes.empty()
+            ? 0.0
+            : (double) window_audio.size() / (double) codes.size();
+        const size_t begin_in_window = (size_t) std::llround(
+            (double) (committed_codes - window_start_code) * samples_per_code_actual);
+        const size_t end_in_window = (size_t) std::llround(
+            (double) (target_committed_codes - window_start_code) * samples_per_code_actual);
         const size_t safe_end = std::min(end_in_window, window_audio.size());
         if (begin_in_window >= safe_end) {
             if (is_final) {
@@ -608,4 +636,16 @@ bool TestToSpeech::synthesize_stream(const VoiceModel & voice,
                                      const StreamCallback & callback,
                                      size_t chunk_samples) {
     return synthesize_stream(voice, text, callback, chunk_samples, Options{});
+}
+
+bool TestToSpeech::generate_token_text(const std::string & text,
+                                       const Options & options,
+                                       std::string & out_token_text) {
+    out_token_text.clear();
+    if (options.skip_llm) {
+        out_token_text = text;
+        return true;
+    }
+    out_token_text = run_llm(text, options);
+    return !out_token_text.empty();
 }

@@ -2,6 +2,7 @@
 #include "miniaudio.h"
 
 #include "test-to-speech.h"
+#include "wav-writer.h"
 
 #include <condition_variable>
 #include <cstdio>
@@ -25,6 +26,7 @@ struct args_t {
     std::string codec_path;
     std::string voice_path;
     std::string prompt;
+    std::string dump_fed_wav_path;
     float temperature = 0.8f;
     int max_tokens = 700;
     int n_threads = 4;
@@ -49,6 +51,7 @@ static void print_usage(const char * prog) {
         "  --threads N             Number of CPU threads (default: 4)\n"
         "  -ngl N                  Number of GPU layers (default: 0)\n"
         "  --chunk-samples N       Callback chunk size in samples (default: 4096)\n"
+        "  --dump-fed-wav PATH     Save exactly what audio callback sent to device\n"
         "  --skip-llm              Treat --prompt as raw <|s_N|> token text\n"
         "  -h, --help              Show this help\n"
         "\n",
@@ -85,6 +88,9 @@ static bool parse_args(int argc, char ** argv, args_t & args) {
         } else if (arg == "--chunk-samples") {
             if (++i >= argc) return false;
             args.chunk_samples = static_cast<size_t>(std::stoul(argv[i]));
+        } else if (arg == "--dump-fed-wav") {
+            if (++i >= argc) return false;
+            args.dump_fed_wav_path = argv[i];
         } else if (arg == "--skip-llm") {
             args.skip_llm = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -151,6 +157,8 @@ struct playback_state {
     size_t max_queued_samples = 0;
     bool finished = false;
     bool aborted = false;
+    bool capture_fed_audio = false;
+    std::vector<float> fed_audio;
 };
 
 static void audio_callback(ma_device * device, void * output, const void *, ma_uint32 frame_count) {
@@ -166,6 +174,9 @@ static void audio_callback(ma_device * device, void * output, const void *, ma_u
         } else {
             out[i] = 0.0f;
         }
+    }
+    if (st->capture_fed_audio) {
+        st->fed_audio.insert(st->fed_audio.end(), out, out + frame_count);
     }
     st->cv.notify_all();
 }
@@ -219,6 +230,10 @@ int main(int argc, char ** argv) {
 
     playback_state st;
     st.max_queued_samples = static_cast<size_t>(tts.sample_rate()) * 10; // ~10s buffer cap
+    st.capture_fed_audio = !args.dump_fed_wav_path.empty();
+    if (st.capture_fed_audio) {
+        st.fed_audio.reserve(static_cast<size_t>(tts.sample_rate()) * 30); // initial 30s
+    }
 
     ma_device_config dev_cfg = ma_device_config_init(ma_device_type_playback);
     dev_cfg.playback.format = ma_format_f32;
@@ -282,6 +297,16 @@ int main(int argc, char ** argv) {
 
     ma_device_stop(&device);
     ma_device_uninit(&device);
+
+    if (st.capture_fed_audio) {
+        if (!wav_write(args.dump_fed_wav_path, st.fed_audio, tts.sample_rate())) {
+            std::printf("Failed to write fed-audio WAV: %s\n", args.dump_fed_wav_path.c_str());
+        } else {
+            std::printf("Saved fed-audio WAV: %s (%zu samples)\n",
+                        args.dump_fed_wav_path.c_str(),
+                        st.fed_audio.size());
+        }
+    }
 
     if (!ok) {
         std::fprintf(stderr, "Error: synthesize_stream failed or playback aborted\n");

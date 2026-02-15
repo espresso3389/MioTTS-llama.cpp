@@ -50,6 +50,7 @@ public:
         float temperature = -1.0f; // negative => use Config default
         int max_tokens = -1;       // negative => use Config default
         bool skip_llm = false;     // when true, text is raw <|s_N|> token text
+        bool apply_peak_normalization = true;
     };
 
     using StreamCallback = std::function<bool(const float * samples,
@@ -97,12 +98,16 @@ public:
                                     size_t chunk_samples,
                                     const Options & options,
                                     StreamProfile & profile);
+    bool generate_token_text(const std::string & text,
+                             const Options & options,
+                             std::string & out_token_text);
 
 private:
     std::string run_llm(const std::string & text, const Options & options);
     bool decode_tokens_to_audio(const VoiceModel & voice,
                                 const std::string & token_text,
-                                std::vector<float> & out_audio);
+                                std::vector<float> & out_audio,
+                                bool apply_peak_normalization);
     static std::string build_prompt(const std::string & text);
 
 private:
