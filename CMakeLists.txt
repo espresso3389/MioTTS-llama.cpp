@@ -18,6 +18,7 @@ add_executable(miotts
     src/main.cpp
     src/miocodec.cpp
     src/istft.cpp
+    src/text-normalize.cpp
     src/token-parser.cpp
     src/wav-writer.cpp
 )

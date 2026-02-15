@@ -2,6 +2,7 @@
 
 #include "miocodec.h"
 #include "istft.h"
+#include "text-normalize.h"
 #include "token-parser.h"
 #include "wav-writer.h"
 
@@ -132,8 +133,13 @@ static std::string run_llm(const miotts_params & params) {
         return "";
     }
 
-    // Build and tokenize the prompt
-    std::string prompt = build_prompt(params.text);
+    // Build and tokenize the prompt.
+    // Match miotts_server behavior by normalizing Japanese punctuation/spacing.
+    std::string normalized_text = normalize_tts_text(params.text);
+    if (normalized_text != params.text) {
+        fprintf(stderr, "Normalized text: %s\n", normalized_text.c_str());
+    }
+    std::string prompt = build_prompt(normalized_text);
     fprintf(stderr, "Prompt: %s\n", prompt.c_str());
 
     std::vector<llama_token> tokens(prompt.size() + 32);
