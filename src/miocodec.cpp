@@ -541,19 +541,10 @@ std::vector<float> miocodec_decode(
     ggml_tensor * dec_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S_dec, S_dec);
     ggml_set_name(dec_mask, "dec_mask");
 
-    // Debug checkpoints: ggml_dup keeps a copy safe from allocator reuse
-    std::vector<ggml_tensor *> dbg_tensors;
-    auto dbg = [&](const char * name, ggml_tensor * t) {
-        ggml_tensor * cp = ggml_dup(ctx, t);
-        ggml_set_name(cp, name);
-        dbg_tensors.push_back(cp);
-    };
-
     // ---- 1. Token embedding lookup ----
     ggml_tensor * tok_emb = W("token_embd");
     ggml_tensor * x = ggml_get_rows(ctx, tok_emb, code_indices);
     // x: [768, T] (transformer format)
-    dbg("dbg_embd", x);
 
     // ---- 2. Wave prenet ----
     int head_dim_pre = pre_dim / mctx->prenet_heads;
@@ -573,14 +564,12 @@ std::vector<float> miocodec_decode(
     x = linear(ctx, x, W("wave_prenet.output.weight"), W("wave_prenet.output.bias"));
 
     // x: [512, T]
-    dbg("dbg_prenet", x);
 
     // ---- 3. wave_upsample: ConvTranspose1d(512, 512, k=2, s=2) ----
     x = transpose2d(ctx, x); // [T, 512] conv format
     x = ggml_conv_transpose_1d(ctx, W("wave_upsample.weight"), x, 2, 0, 1);
     x = add_conv_bias(ctx, x, W("wave_upsample.bias"));
     // x: [T*2, 512] = [S_dec, 512] conv format
-    dbg("dbg_upsample", x);
 
     // ---- 4. wave_prior: 2 ResNet blocks ----
     for (int blk = 0; blk < mctx->resnet_blocks; blk++) {
@@ -592,7 +581,6 @@ std::vector<float> miocodec_decode(
             W(p+"conv2.weight"), W(p+"conv2.bias"),
             mctx->resnet_groups, gn_eps);
     }
-    dbg("dbg_prior", x);
     x = transpose2d(ctx, x); // [512, S_dec] transformer format
     // ---- 5. wave_decoder: 8 AdaLN-Zero Transformer layers ----
     int head_dim_dec = dec_dim / mctx->decoder_heads;
@@ -605,8 +593,6 @@ std::vector<float> miocodec_decode(
             W(p+"ffn_gate.weight"), W(p+"ffn_up.weight"), W(p+"ffn_down.weight"),
             ones_dec, dec_mask, pos_dec,
             mctx->decoder_heads, head_dim_dec, mctx->rope_theta, norm_eps);
-        std::string dec_name = "dbg_dec" + std::to_string(i);
-        dbg(dec_name.c_str(), x);
     }
 
     // ---- 6. Final AdaLN norm ----
@@ -631,7 +617,6 @@ std::vector<float> miocodec_decode(
             mctx->resnet_groups, gn_eps);
     }
     // x: [S_dec, 512] conv format
-    dbg("dbg_post", x);
 
     // ---- 8. wave_upsampler stages ----
     // Python: wave_upsampler is applied AFTER wave_post, BEFORE istft_head
@@ -685,8 +670,6 @@ std::vector<float> miocodec_decode(
         x = ggml_add(ctx, x, sc);
     }
 
-    dbg("dbg_upsampler", x);
-
     // ---- 9. iSTFT head: Linear(512, 394) → mag + phase ----
     x = linear(ctx, x, W("istft_head.out.weight"), W("istft_head.out.bias"));
     // x: [394, S_final]
@@ -706,7 +689,6 @@ std::vector<float> miocodec_decode(
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 65536, false);
     ggml_build_forward_expand(graph, real_part);
     ggml_build_forward_expand(graph, imag_part);
-    for (auto * dt : dbg_tensors) ggml_build_forward_expand(graph, dt);
 
     fprintf(stderr, "miocodec: graph has %d nodes\n", ggml_graph_n_nodes(graph));
 
@@ -752,28 +734,6 @@ std::vector<float> miocodec_decode(
         ggml_gallocr_free(allocr);
         ggml_free(ctx);
         return {};
-    }
-
-    // Print debug checkpoints
-    for (auto * dt : dbg_tensors) {
-        int n = std::min((int)ggml_nelements(dt), 5);
-        std::vector<float> vals(n);
-        ggml_backend_tensor_get(dt, vals.data(), 0, n * sizeof(float));
-        fprintf(stderr, "miocodec: %s [%lld, %lld]: first 5:",
-                dt->name, (long long)dt->ne[0], (long long)dt->ne[1]);
-        for (int i = 0; i < n; i++) fprintf(stderr, " %.4f", vals[i]);
-        // Also print stats
-        int total = ggml_nelements(dt);
-        std::vector<float> all(total);
-        ggml_backend_tensor_get(dt, all.data(), 0, total * sizeof(float));
-        float vmin = all[0], vmax = all[0];
-        double vsum = 0;
-        for (int i = 0; i < total; i++) {
-            vmin = std::min(vmin, all[i]);
-            vmax = std::max(vmax, all[i]);
-            vsum += all[i];
-        }
-        fprintf(stderr, " | min=%.4f max=%.4f mean=%.4f\n", vmin, vmax, (float)(vsum/total));
     }
 
     // Read back spectrogram: interleave [real, imag] per frame

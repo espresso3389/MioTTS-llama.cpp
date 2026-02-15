@@ -19,6 +19,7 @@ add_executable(miotts
     src/miocodec.cpp
     src/istft.cpp
     src/text-normalize.cpp
+    src/test-to-speech.cpp
     src/token-parser.cpp
     src/wav-writer.cpp
 )
@@ -30,6 +31,29 @@ target_include_directories(miotts PRIVATE
 )
 
 target_link_libraries(miotts PRIVATE
+    llama
+    ggml
+    m
+)
+
+add_executable(miotts-stream-device
+    examples/stream-to-device.cpp
+    src/miocodec.cpp
+    src/istft.cpp
+    src/text-normalize.cpp
+    src/test-to-speech.cpp
+    src/token-parser.cpp
+    src/wav-writer.cpp
+)
+
+target_include_directories(miotts-stream-device PRIVATE
+    src
+    third_party/llama.cpp/include
+    third_party/llama.cpp/ggml/include
+    third_party/llama.cpp/vendor/miniaudio
+)
+
+target_link_libraries(miotts-stream-device PRIVATE
     llama
     ggml
     m
