@@ -13,31 +13,33 @@ set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/llama.cpp)
 
-# Optional ONNX Runtime codec backend
-option(MIOTTS_ONNX "Enable ONNX Runtime codec backend" OFF)
-
+# Auto-detect ONNX Runtime codec backend (set ONNXRUNTIME_DIR to specify location)
 set(MIOTTS_ONNX_SOURCES "")
-set(MIOTTS_ONNX_INCLUDE_DIRS "")
 set(MIOTTS_ONNX_LIBRARIES "")
 set(MIOTTS_ONNX_DEFINITIONS "")
 
-if(MIOTTS_ONNX)
-    # Allow user to specify ONNXRUNTIME_DIR for custom install location
-    find_library(ONNXRUNTIME_LIB onnxruntime
-        HINTS ${ONNXRUNTIME_DIR}/lib
-        REQUIRED)
+# Try system/package-manager install first
+find_package(onnxruntime QUIET)
+
+# Fallback: pre-built SDK tarball (its CMake config has a lib64/lib mismatch)
+if(NOT onnxruntime_FOUND AND ONNXRUNTIME_DIR)
+    find_library(ONNXRUNTIME_LIB onnxruntime HINTS ${ONNXRUNTIME_DIR}/lib REQUIRED)
     find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h
-        HINTS ${ONNXRUNTIME_DIR}/include
-        PATH_SUFFIXES onnxruntime
-        REQUIRED)
+        HINTS ${ONNXRUNTIME_DIR}/include PATH_SUFFIXES onnxruntime REQUIRED)
+    add_library(onnxruntime::onnxruntime SHARED IMPORTED)
+    set_target_properties(onnxruntime::onnxruntime PROPERTIES
+        IMPORTED_LOCATION ${ONNXRUNTIME_LIB}
+        INTERFACE_INCLUDE_DIRECTORIES ${ONNXRUNTIME_INCLUDE})
+    set(onnxruntime_FOUND TRUE)
+endif()
 
-    message(STATUS "ONNX Runtime library: ${ONNXRUNTIME_LIB}")
-    message(STATUS "ONNX Runtime include: ${ONNXRUNTIME_INCLUDE}")
-
+if(onnxruntime_FOUND)
+    message(STATUS "ONNX Runtime found — ONNX codec backend enabled")
     set(MIOTTS_ONNX_SOURCES src/codec-backend-onnx.cpp)
-    set(MIOTTS_ONNX_INCLUDE_DIRS ${ONNXRUNTIME_INCLUDE})
-    set(MIOTTS_ONNX_LIBRARIES ${ONNXRUNTIME_LIB})
+    set(MIOTTS_ONNX_LIBRARIES onnxruntime::onnxruntime)
     set(MIOTTS_ONNX_DEFINITIONS MIOTTS_HAS_ONNX)
+else()
+    message(STATUS "ONNX Runtime not found — ONNX codec backend disabled (set ONNXRUNTIME_DIR to enable)")
 endif()
 
 # Common source files
@@ -57,7 +59,6 @@ function(miotts_configure_target target)
         src
         third_party/llama.cpp/include
         third_party/llama.cpp/ggml/include
-        ${MIOTTS_ONNX_INCLUDE_DIRS}
         ${ARGN}
     )
     target_link_libraries(${target} PRIVATE

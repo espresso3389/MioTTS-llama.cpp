@@ -23,9 +23,11 @@ cmake --build build --target miotts
 
 To enable the ONNX Runtime codec backend (optional, see [ONNX backend](#onnx-backend) below):
 ```bash
-cmake -B build -DMIOTTS_ONNX=ON -DONNXRUNTIME_DIR=/path/to/onnxruntime
+cmake -B build -DONNXRUNTIME_DIR=/path/to/onnxruntime
 cmake --build build --target miotts
 ```
+
+If ONNX Runtime is installed system-wide, it is auto-detected without any extra flags.
 
 ### 2. Download models
 
@@ -70,7 +72,7 @@ Using the GGUF codec (44.1 kHz output):
   -o output.wav
 ```
 
-Or using the ONNX codec (24 kHz output, requires `-DMIOTTS_ONNX=ON` build):
+Or using the ONNX codec (24 kHz output, requires ONNX Runtime at build time):
 ```bash
 ./build/miotts \
   -m models/MioTTS-0.1B-Q8_0.gguf \
@@ -262,18 +264,20 @@ The ONNX backend uses [ONNX Runtime](https://onnxruntime.ai/) to run the MioCode
 
 2. Build with ONNX support:
 ```bash
-cmake -B build -DMIOTTS_ONNX=ON -DONNXRUNTIME_DIR=/path/to/onnxruntime-linux-x64-1.24.2
+cmake -B build -DONNXRUNTIME_DIR=/path/to/onnxruntime-linux-x64-1.24.2
 cmake --build build
 ```
+
+If ONNX Runtime is installed system-wide (e.g. via a package manager), it is auto-detected and `ONNXRUNTIME_DIR` is not needed.
 
 3. Export the ONNX model files from [MioCodec-25Hz-24kHz](https://huggingface.co/Aratako/MioCodec-25Hz-24kHz):
 
 ```bash
-pip install miocodec torch onnx onnxruntime numpy
-python3 tools/export_miocodec_onnx.py --output-dir models/
+pip install miocodec torch onnx onnxruntime numpy gguf
+python3 tools/export_miocodec_onnx.py
 ```
 
-This single command downloads the model from HuggingFace and exports all three ONNX files:
+This single command downloads the model from HuggingFace, exports all three ONNX files to `models/`, and converts the built-in voice embeddings (`.emb.gguf` -> `.emb.bin`):
 
 | File | Size | Description |
 |------|------|-------------|
@@ -300,13 +304,13 @@ cmake --build build --target miotts-codec-benchmark
 
 ### `tools/export_miocodec_onnx.py`
 
-Export all MioCodec ONNX models (decoder + global encoder + content encoder) in one command. Downloads MioCodec-25Hz-24kHz from HuggingFace automatically. Requires `miocodec`, `torch`, `onnx`, `onnxruntime`.
+Export all MioCodec ONNX models and convert built-in voice embeddings in one command. Downloads MioCodec-25Hz-24kHz from HuggingFace automatically. Requires `miocodec`, `torch`, `onnx`, `onnxruntime`, `gguf`.
 
 ```bash
-python3 tools/export_miocodec_onnx.py --output-dir models/
+python3 tools/export_miocodec_onnx.py
 ```
 
-Use `--skip-encoders` to export only the decoder.
+Use `--skip-encoders` to export only the decoder. Use `--output-dir` to change the output directory (default: `models/`).
 
 ### `tools/create_voice_emb_onnx.py`
 

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Export MioCodec to ONNX (decoder + global encoder + content encoder).
+"""Export MioCodec to ONNX and convert built-in voice embeddings.
 
 Downloads MioCodec-25Hz-24kHz from HuggingFace and exports three ONNX models:
   1. miocodec_decoder.onnx         - speech codes + voice -> waveform (required)
   2. miocodec_global_encoder.onnx  - audio -> voice embedding (for voice cloning)
   3. miocodec_content_encoder.onnx - audio -> speech codes (for testing)
 
+Also converts any .emb.gguf voice files in the output directory to .emb.bin
+(raw float32 binary) for use with the ONNX codec backend.
+
 Usage:
-    pip install miocodec torch onnx onnxruntime numpy
-    python tools/export_miocodec_onnx.py --output-dir models/
+    pip install miocodec torch onnx onnxruntime numpy gguf
+    python tools/export_miocodec_onnx.py
 
 Key ONNX-compatibility changes applied automatically:
 - RoPE: complex-number ops replaced with real-valued cos/sin
@@ -376,16 +379,43 @@ def export_and_verify(module, dummy_inputs, output_path, input_names, output_nam
 
 
 # ============================================================================
+# Voice embedding conversion (.emb.gguf -> .emb.bin)
+# ============================================================================
+
+def convert_voice_gguf_to_bin(output_dir):
+    """Convert all .emb.gguf files in output_dir to .emb.bin (raw float32)."""
+    import glob as glob_mod
+    import gguf
+
+    gguf_files = sorted(glob_mod.glob(os.path.join(output_dir, "*.emb.gguf")))
+    if not gguf_files:
+        print("  No .emb.gguf files found, skipping")
+        return
+
+    for gguf_path in gguf_files:
+        stem = os.path.basename(gguf_path).replace(".emb.gguf", "")
+        bin_path = os.path.join(output_dir, f"{stem}.emb.bin")
+
+        reader = gguf.GGUFReader(gguf_path)
+        embedding = reader.tensors[0].data.astype(np.float32)
+
+        with open(bin_path, "wb") as f:
+            f.write(embedding.tobytes())
+        print(f"  {os.path.basename(gguf_path)} -> {os.path.basename(bin_path)} "
+              f"({len(embedding)} floats, {os.path.getsize(bin_path)} bytes)")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Export MioCodec to ONNX (decoder + global encoder + content encoder)"
+        description="Export MioCodec to ONNX and convert built-in voice embeddings"
     )
     parser.add_argument(
-        "--output-dir", default=".",
-        help="Output directory for ONNX files (default: current directory)",
+        "--output-dir", default="models",
+        help="Output directory (default: models/)",
     )
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument(
@@ -505,6 +535,12 @@ def main():
         print(f"  Export failed: {e}")
         import traceback
         traceback.print_exc()
+
+    # ---- Voice embeddings ----
+    print("\n" + "=" * 60)
+    print("Voice embeddings: .emb.gguf -> .emb.bin")
+    print("=" * 60)
+    convert_voice_gguf_to_bin(args.output_dir)
 
     # ---- Summary ----
     print("\n" + "=" * 60)
