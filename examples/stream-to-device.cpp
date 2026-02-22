@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +26,7 @@
 struct args_t {
     std::string model_path;
     std::string codec_path;
+    std::string codec_type = "ggml";
     std::string voice_path;
     std::string prompt;
     std::string dump_fed_wav_path;
@@ -32,7 +35,6 @@ struct args_t {
     int n_threads = 4;
     int n_gpu_layers = 0;
     size_t chunk_samples = 4096;
-    bool skip_llm = false;
 };
 
 static void print_usage(const char * prog) {
@@ -41,18 +43,20 @@ static void print_usage(const char * prog) {
         "\n"
         "Stream MioTTS audio directly to the system audio device.\n"
         "\n"
+        "Codec backend:\n"
+        "  -gguf PATH              MioCodec GGUF model (44.1kHz)\n"
+        "  -onnx PATH              MioCodec ONNX decoder (24kHz)\n"
+        "\n"
         "Options:\n"
-        "  -m, --model PATH        MioTTS LLM GGUF model path (required unless --skip-llm)\n"
-        "  -c, --codec PATH        MioCodec GGUF model path (required)\n"
-        "  -v, --voice PATH        Voice embedding .emb.gguf path (required)\n"
-        "  -p, --prompt TEXT       Text to synthesize (required)\n"
+        "  -m, --model PATH        MioTTS LLM GGUF model path\n"
+        "  -v, --voice PATH        Voice embedding (.emb.gguf or .bin)\n"
+        "  -p, --prompt TEXT       Text to synthesize (use '-' for stdin)\n"
         "  -t, --temp FLOAT        Sampling temperature (default: 0.8)\n"
         "  --max-tokens N          Max tokens to generate (default: 700)\n"
         "  --threads N             Number of CPU threads (default: 4)\n"
         "  -ngl N                  Number of GPU layers (default: 0)\n"
         "  --chunk-samples N       Callback chunk size in samples (default: 4096)\n"
         "  --dump-fed-wav PATH     Save exactly what audio callback sent to device\n"
-        "  --skip-llm              Treat --prompt as raw <|s_N|> token text\n"
         "  -h, --help              Show this help\n"
         "\n",
         prog);
@@ -64,6 +68,14 @@ static bool parse_args(int argc, char ** argv, args_t & args) {
         if (arg == "-m" || arg == "--model") {
             if (++i >= argc) return false;
             args.model_path = argv[i];
+        } else if (arg == "-gguf") {
+            if (++i >= argc) return false;
+            args.codec_path = argv[i];
+            args.codec_type = "ggml";
+        } else if (arg == "-onnx") {
+            if (++i >= argc) return false;
+            args.codec_path = argv[i];
+            args.codec_type = "onnx";
         } else if (arg == "-c" || arg == "--codec") {
             if (++i >= argc) return false;
             args.codec_path = argv[i];
@@ -92,7 +104,7 @@ static bool parse_args(int argc, char ** argv, args_t & args) {
             if (++i >= argc) return false;
             args.dump_fed_wav_path = argv[i];
         } else if (arg == "--skip-llm") {
-            args.skip_llm = true;
+            // kept for backward compat, no-op
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             std::exit(0);
@@ -188,22 +200,30 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Read prompt from stdin if "-p -"
+    if (args.prompt == "-") {
+        std::ostringstream ss;
+        ss << std::cin.rdbuf();
+        args.prompt = ss.str();
+        while (!args.prompt.empty() && (args.prompt.back() == '\n' || args.prompt.back() == '\r')) {
+            args.prompt.pop_back();
+        }
+    }
+
     if (args.prompt.empty()) {
-        std::fprintf(stderr, "Error: --prompt is required\n");
+        std::fprintf(stderr, "Error: -p is required\n");
         return 1;
     }
     if (args.codec_path.empty()) {
-        std::fprintf(stderr, "Error: --codec is required\n");
+        std::fprintf(stderr, "Error: codec path is required (-gguf or -onnx)\n");
         return 1;
     }
     if (args.voice_path.empty()) {
-        std::fprintf(stderr, "Error: --voice is required\n");
+        std::fprintf(stderr, "Error: -v is required\n");
         return 1;
     }
-    if (!args.skip_llm && args.model_path.empty()) {
-        std::fprintf(stderr, "Error: --model is required (or use --skip-llm)\n");
-        return 1;
-    }
+
+    bool skip_llm = args.model_path.empty();
 
     // This sample is intended to play audio, not print backend/model debug logs.
     scoped_stderr_silencer silencer(true);
@@ -211,6 +231,7 @@ int main(int argc, char ** argv) {
     TestToSpeech::Config cfg;
     cfg.model_path = args.model_path;
     cfg.codec_path = args.codec_path;
+    cfg.codec_type = args.codec_type;
     cfg.n_threads = args.n_threads;
     cfg.n_gpu_layers = args.n_gpu_layers;
     cfg.temperature = args.temperature;
@@ -256,7 +277,7 @@ int main(int argc, char ** argv) {
     TestToSpeech::Options opt;
     opt.temperature = args.temperature;
     opt.max_tokens = args.max_tokens;
-    opt.skip_llm = args.skip_llm;
+    opt.skip_llm = skip_llm;
 
     const bool ok = tts.synthesize_stream(
         voice,
