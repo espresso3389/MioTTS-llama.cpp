@@ -266,10 +266,29 @@ cmake -B build -DMIOTTS_ONNX=ON -DONNXRUNTIME_DIR=/path/to/onnxruntime-linux-x64
 cmake --build build
 ```
 
-3. You need the ONNX model files (exported from [MioCodec-25Hz-24kHz](https://huggingface.co/Aratako/MioCodec-25Hz-24kHz)):
-   - `miocodec_decoder.onnx` -- decodes speech codes to waveform
-   - `miocodec_global_encoder.onnx` -- extracts voice embedding from audio
-   - `miocodec_content_encoder.onnx` -- extracts speech codes from audio (for testing)
+3. Export the ONNX model files from [MioCodec-25Hz-24kHz](https://huggingface.co/Aratako/MioCodec-25Hz-24kHz):
+
+```bash
+pip install miocodec torch onnx onnxruntime numpy
+
+# Export decoder (tokens + voice embedding -> waveform)
+python3 scripts/export_miocodec_decoder_onnx.py --output miocodec_decoder.onnx --verify
+
+# Export encoders (waveform -> voice embedding / speech codes)
+python3 scripts/export_miocodec_encoder_onnx.py --verify
+```
+
+This produces three files:
+
+| File | Size | Description |
+|------|------|-------------|
+| `miocodec_decoder.onnx` | ~354 MB | Speech codes + voice embedding -> waveform (required) |
+| `miocodec_global_encoder.onnx` | ~112 MB | Audio -> 128-dim voice embedding (for `create_voice_emb_onnx.py`) |
+| `miocodec_content_encoder.onnx` | ~447 MB | Audio -> speech codes (for `extract_codes_onnx.py`, testing) |
+
+Only the decoder is needed at runtime. The encoders are helper tools for preparing voice embeddings and extracting speech codes from reference audio.
+
+The export scripts handle ONNX compatibility issues automatically (RoPE with real-valued ops, iDFT via matrix multiply, overlap-add via ConvTranspose1d).
 
 ### Codec benchmark
 
@@ -283,6 +302,24 @@ cmake --build build --target miotts-codec-benchmark
 ```
 
 ## Scripts
+
+### `scripts/export_miocodec_decoder_onnx.py`
+
+Export the MioCodec decoder from PyTorch to ONNX. Requires `miocodec`, `torch`, `onnx`, `onnxruntime`.
+
+```bash
+python3 scripts/export_miocodec_decoder_onnx.py --output miocodec_decoder.onnx --verify
+```
+
+### `scripts/export_miocodec_encoder_onnx.py`
+
+Export the MioCodec global encoder and content encoder from PyTorch to ONNX. Imports from `export_miocodec_decoder_onnx.py` (must be in the same directory).
+
+```bash
+python3 scripts/export_miocodec_encoder_onnx.py --verify
+```
+
+Outputs `miocodec_global_encoder.onnx` and `miocodec_content_encoder.onnx`.
 
 ### `scripts/create_voice_emb_onnx.py`
 
@@ -324,4 +361,4 @@ python3 scripts/extract_codes_onnx.py \
 
 ## License
 
-See LICENSE file for details.
+See [LICENSE](./LICENSE) file for details.
