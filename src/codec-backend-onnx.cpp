@@ -4,7 +4,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 // MioCodec-25Hz-24kHz constants
@@ -24,6 +26,49 @@ static int64_t calculate_stft_length(int n_codes) {
     return audio_length / 480; // istft_padding == "same"
 }
 
+static bool append_onnx_provider(Ort::SessionOptions & opts, const std::string & ep, int device_id) {
+    if (ep == "cuda") {
+        try {
+            Ort::CUDAProviderOptions cuda_opts;
+            cuda_opts.Update({{"device_id", std::to_string(device_id)}});
+            opts.AppendExecutionProvider_CUDA_V2(*cuda_opts);
+            std::fprintf(stderr, "onnx_ep: using CUDAExecutionProvider (device_id=%d)\n", device_id);
+            return true;
+        } catch (const Ort::Exception & e) {
+            std::fprintf(stderr, "onnx_ep: CUDA append failed: %s\n", e.what());
+            return false;
+        }
+    }
+    if (ep == "tensorrt" || ep == "trt") {
+        try {
+            Ort::TensorRTProviderOptions trt_opts;
+            trt_opts.Update({{"device_id", std::to_string(device_id)}});
+            opts.AppendExecutionProvider_TensorRT_V2(*trt_opts);
+            std::fprintf(stderr, "onnx_ep: using TensorRTExecutionProvider (device_id=%d)\n", device_id);
+            return true;
+        } catch (const Ort::Exception & e) {
+            std::fprintf(stderr, "onnx_ep: TensorRT append failed: %s\n", e.what());
+            return false;
+        }
+    }
+    return false;
+}
+
+static void configure_onnx_providers(Ort::SessionOptions & opts) {
+    const char * ep_env = std::getenv("MIOTTS_ONNX_EP");
+    const char * dev_env = std::getenv("MIOTTS_ONNX_DEVICE_ID");
+    const int device_id = dev_env ? std::max(0, std::atoi(dev_env)) : 0;
+    const std::string ep = ep_env ? ep_env : "";
+
+    if (ep.empty() || ep == "cpu" || ep == "default") {
+        std::fprintf(stderr, "onnx_ep: using default provider chain (CPU)\n");
+        return;
+    }
+    if (!append_onnx_provider(opts, ep, device_id)) {
+        std::fprintf(stderr, "onnx_ep: fallback to default provider chain (CPU)\n");
+    }
+}
+
 struct OnnxCodecBackend::Impl {
     Ort::Env env{nullptr};
     Ort::Session session{nullptr};
@@ -37,6 +82,7 @@ OnnxCodecBackend::OnnxCodecBackend(const std::string & model_path)
         impl_->env = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "miocodec_onnx");
         Ort::SessionOptions opts;
         opts.SetIntraOpNumThreads(4);
+        configure_onnx_providers(opts);
         impl_->session = Ort::Session(impl_->env, model_path.c_str(), opts);
         impl_->mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         impl_->valid = true;

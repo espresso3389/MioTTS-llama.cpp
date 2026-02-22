@@ -7,6 +7,9 @@
 #include <vector>
 
 class CodecBackend;
+#ifdef MIOTTS_HAS_ONNX
+class OnnxLlmBackend;
+#endif
 
 class VoiceModel {
 public:
@@ -39,6 +42,8 @@ public:
 
     struct Config {
         std::string model_path;
+        std::string model_onnx_path;
+        std::string tokenizer_path;
         std::string codec_path;
         std::string codec_type = "ggml"; // "ggml" or "onnx"
         int n_threads = 4;
@@ -114,7 +119,11 @@ private:
 private:
     Config config_;
     struct llama_model * model_ = nullptr;
+    struct llama_model * tokenizer_model_ = nullptr;
     const struct llama_vocab * vocab_ = nullptr;
+#ifdef MIOTTS_HAS_ONNX
+    std::unique_ptr<OnnxLlmBackend> onnx_llm_;
+#endif
     std::unique_ptr<CodecBackend> codec_;
     int sample_rate_ = 0;
     int samples_per_token_ = 0;

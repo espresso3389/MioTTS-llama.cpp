@@ -22,7 +22,7 @@ cmake -B build
 cmake --build build --target miotts
 ```
 
-To enable the ONNX Runtime codec backend (optional, see [ONNX backend](#onnx-backend) below):
+To enable the ONNX Runtime backends (codec + optional MioTTS ONNX LLM support):
 ```bash
 cmake -B build -DONNXRUNTIME_DIR=/path/to/onnxruntime
 cmake --build build --target miotts
@@ -150,6 +150,8 @@ These defaults prioritize clean playback over minimum latency.
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-m, --model PATH` | LLM model file | |
+| `--model-onnx PATH` | MioTTS ONNX LLM model file | |
+| `--tokenizer PATH` | GGUF tokenizer model path (required with `--model-onnx`) | |
 | `-gguf PATH` | MioCodec GGUF model (44.1 kHz) | |
 | `-onnx PATH` | MioCodec ONNX decoder (24 kHz) | |
 | `-v, --voice PATH` | Voice embedding (`.emb.gguf` or `.bin`) | |
@@ -165,9 +167,9 @@ These defaults prioritize clean playback over minimum latency.
 
 The tool operates in three modes depending on which flags are provided:
 
-1. **Text-to-speech** (`-m` + `-gguf`/`-onnx` + `-v` + `-p`): Full pipeline, text in, WAV out.
-2. **Tokens-only** (`-m` + `--tokens-only` + `-p`): Run only the LLM, print speech codes to stdout. No codec needed.
-3. **Decode-only** (`-gguf`/`-onnx` + `-v` + `-p`, no `-m`): Decode pre-generated speech codes to WAV.
+1. **Text-to-speech** (`-m` or `--model-onnx ... --tokenizer ...` + `-gguf`/`-onnx` + `-v` + `-p`): Full pipeline, text in, WAV out.
+2. **Tokens-only** (`-m` or `--model-onnx ... --tokenizer ...` + `--tokens-only` + `-p`): Run only the LLM, print speech codes to stdout. No codec needed.
+3. **Decode-only** (`-gguf`/`-onnx` + `-v` + `-p`, no LLM model): Decode pre-generated speech codes to WAV.
 
 ## Choosing a voice
 
@@ -233,6 +235,12 @@ English (ONNX):
   -v models/voice.emb.bin -p "The quick brown fox jumps over the lazy dog." -o hello_en.wav
 ```
 
+MioTTS ONNX LLM + ONNX codec:
+```bash
+./build/miotts --model-onnx models/miotts.onnx --tokenizer models/MioTTS-0.1B-Q8_0.gguf \
+  -onnx models/miocodec_decoder.onnx -v models/voice.emb.bin -p "Hello from ONNX." -o hello_onnx.wav
+```
+
 With GPU acceleration (CUDA):
 ```bash
 ./build/miotts -m models/MioTTS-0.1B-Q8_0.gguf -gguf models/miocodec.gguf \
@@ -255,7 +263,11 @@ Two-step pipeline (generate tokens, then decode separately):
 
 ## ONNX backend
 
-The ONNX backend uses [ONNX Runtime](https://onnxruntime.ai/) to run the MioCodec-25Hz-24kHz decoder, producing 24 kHz audio directly (ISTFT is baked into the model). It is typically 3-5x faster than the GGML backend for codec decoding.
+The ONNX backend uses [ONNX Runtime](https://onnxruntime.ai/) for:
+- MioCodec decoder (`-onnx`) at 24 kHz (ISTFT baked into model)
+- MioTTS LLM inference (`--model-onnx`) using GGUF tokenizer vocab (`--tokenizer`)
+
+Current MioTTS ONNX LLM implementation is a compatibility-first path that runs full-sequence decoding each step (no KV cache), so it may be slower than GGUF llama.cpp inference.
 
 ### Setup
 
@@ -286,6 +298,23 @@ This single command downloads the model from HuggingFace, exports all three ONNX
 Only the decoder is needed at runtime. To export just the decoder: `--skip-encoders`.
 
 The export handles ONNX compatibility issues automatically (RoPE with real-valued ops, iDFT via matrix multiply, overlap-add via ConvTranspose1d).
+
+4. (Optional) Export MioTTS safetensors LLM to ONNX:
+```bash
+uv run --with transformers --with accelerate \
+  python tools/export_miotts_onnx.py \
+  --model-id Aratako/MioTTS-0.1B \
+  --output models/miotts_0.1b.onnx
+```
+
+Then run with ONNX LLM + GGUF tokenizer vocab:
+```bash
+./build/miotts \
+  --model-onnx models/miotts_0.1b.onnx \
+  --tokenizer models/MioTTS-0.1B-Q8_0.gguf \
+  --tokens-only \
+  -p "こんにちは"
+```
 
 ### Codec benchmark
 
@@ -338,6 +367,18 @@ uv run tools/extract_codes_onnx.py \
   --encoder miocodec_content_encoder.onnx \
   --audio input.wav \
   | ./build/miotts -onnx models/miocodec_decoder.onnx -v models/voice.emb.bin -p - -o output.wav
+```
+
+### `tools/export_miotts_onnx.py`
+
+Export MioTTS safetensors to ONNX for `--model-onnx`.
+The script uses legacy Torch ONNX export plus an ONNX graph patch step for ORT compatibility.
+
+```bash
+uv run --with transformers --with accelerate \
+  python tools/export_miotts_onnx.py \
+  --model-id Aratako/MioTTS-0.1B \
+  --output models/miotts_0.1b.onnx
 ```
 
 ## Credits

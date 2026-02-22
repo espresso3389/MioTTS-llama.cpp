@@ -35,7 +35,10 @@ endif()
 
 if(onnxruntime_FOUND)
     message(STATUS "ONNX Runtime found — ONNX codec backend enabled")
-    set(MIOTTS_ONNX_SOURCES src/codec-backend-onnx.cpp)
+    set(MIOTTS_ONNX_SOURCES
+        src/codec-backend-onnx.cpp
+        src/llm-backend-onnx.cpp
+    )
     set(MIOTTS_ONNX_LIBRARIES onnxruntime::onnxruntime)
     set(MIOTTS_ONNX_DEFINITIONS MIOTTS_HAS_ONNX)
 else()

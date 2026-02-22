@@ -4,6 +4,7 @@
 #include "codec-backend-ggml.h"
 #ifdef MIOTTS_HAS_ONNX
 #include "codec-backend-onnx.h"
+#include "llm-backend-onnx.h"
 #endif
 #include "text-normalize.h"
 #include "token-parser.h"
@@ -16,7 +17,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +58,32 @@ TestToSpeech::TestToSpeech(const Config & config) : config_(config) {
             return;
         }
         vocab_ = llama_model_get_vocab(model_);
+    } else if (!config_.model_onnx_path.empty()) {
+#ifdef MIOTTS_HAS_ONNX
+        if (config_.tokenizer_path.empty()) {
+            fprintf(stderr, "TestToSpeech: --tokenizer is required with --model-onnx\n");
+            return;
+        }
+
+        llama_model_params tok_params = llama_model_default_params();
+        tok_params.n_gpu_layers = 0;
+        tokenizer_model_ = llama_model_load_from_file(config_.tokenizer_path.c_str(), tok_params);
+        if (!tokenizer_model_) {
+            fprintf(stderr, "TestToSpeech: failed to load tokenizer GGUF model: %s\n", config_.tokenizer_path.c_str());
+            return;
+        }
+        vocab_ = llama_model_get_vocab(tokenizer_model_);
+
+        auto backend = std::make_unique<OnnxLlmBackend>(config_.model_onnx_path, config_.n_threads);
+        if (!backend->is_valid()) {
+            fprintf(stderr, "TestToSpeech: failed to load ONNX LLM model: %s\n", config_.model_onnx_path.c_str());
+            return;
+        }
+        onnx_llm_ = std::move(backend);
+#else
+        fprintf(stderr, "TestToSpeech: ONNX support not compiled in\n");
+        return;
+#endif
     }
 
     if (!config_.codec_path.empty()) {
@@ -86,6 +115,13 @@ TestToSpeech::TestToSpeech(const Config & config) : config_(config) {
 
 TestToSpeech::~TestToSpeech() {
     codec_.reset();
+#ifdef MIOTTS_HAS_ONNX
+    onnx_llm_.reset();
+#endif
+    if (tokenizer_model_) {
+        llama_model_free(tokenizer_model_);
+        tokenizer_model_ = nullptr;
+    }
     if (model_) {
         llama_model_free(model_);
         model_ = nullptr;
@@ -94,7 +130,50 @@ TestToSpeech::~TestToSpeech() {
 }
 
 bool TestToSpeech::is_ready() const {
+#ifdef MIOTTS_HAS_ONNX
+    return model_ != nullptr || onnx_llm_ != nullptr || codec_ != nullptr;
+#else
     return model_ != nullptr || codec_ != nullptr;
+#endif
+}
+
+static int sample_token_from_logits(const std::vector<float> & logits, float temperature,
+                                    int vocab_limit, std::mt19937 & rng) {
+    const int n = std::min(vocab_limit, static_cast<int>(logits.size()));
+    if (n <= 0) {
+        return -1;
+    }
+
+    if (temperature <= 1e-5f) {
+        int best = 0;
+        for (int i = 1; i < n; ++i) {
+            if (logits[i] > logits[best]) {
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n; ++i) {
+        max_logit = std::max(max_logit, logits[i] / temperature);
+    }
+
+    std::vector<float> probs(n, 0.0f);
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const float x = (logits[i] / temperature) - max_logit;
+        probs[i] = std::exp(x);
+        sum += probs[i];
+    }
+    if (sum <= 0.0) {
+        return -1;
+    }
+    for (int i = 0; i < n; ++i) {
+        probs[i] = static_cast<float>(probs[i] / sum);
+    }
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    return dist(rng);
 }
 
 // Helper: decode codes to audio via CodecBackend with optional timing.
@@ -146,13 +225,76 @@ std::string TestToSpeech::build_prompt(const std::string & text) {
 }
 
 std::string TestToSpeech::run_llm(const std::string & text, const Options & options) {
+#ifdef MIOTTS_HAS_ONNX
+    if ((!model_ && !onnx_llm_) || !vocab_) {
+#else
     if (!model_ || !vocab_) {
+#endif
         fprintf(stderr, "TestToSpeech: LLM model is not loaded\n");
         return "";
     }
 
     const float temperature = options.temperature >= 0.0f ? options.temperature : config_.temperature;
     const int max_tokens = options.max_tokens > 0 ? options.max_tokens : config_.max_tokens;
+
+    std::string normalized_text = normalize_tts_text(text);
+    std::string prompt = build_prompt(normalized_text);
+
+    std::vector<llama_token> tokens(prompt.size() + 32);
+    int n_tokens = llama_tokenize(vocab_, prompt.c_str(), prompt.size(),
+                                  tokens.data(), tokens.size(), true, true);
+    if (n_tokens < 0) {
+        fprintf(stderr, "TestToSpeech: tokenization failed\n");
+        return "";
+    }
+    tokens.resize(n_tokens);
+
+#ifdef MIOTTS_HAS_ONNX
+    if (onnx_llm_) {
+        llama_token eos_token = llama_vocab_eos(vocab_);
+        llama_token im_end_token = -1;
+        {
+            const char * im_end_str = "<|im_end|>";
+            llama_token tmp[8];
+            int n = llama_tokenize(vocab_, im_end_str, std::strlen(im_end_str), tmp, 8, false, true);
+            if (n == 1) {
+                im_end_token = tmp[0];
+            }
+        }
+
+        std::vector<int32_t> ids(tokens.begin(), tokens.end());
+        std::vector<float> logits;
+        std::string generated;
+        std::mt19937 rng(42);
+
+        const int n_vocab = llama_vocab_n_tokens(vocab_);
+        int n_gen = 0;
+        while (n_gen < max_tokens) {
+            if (!onnx_llm_->forward_logits(ids, logits)) {
+                return "";
+            }
+
+            int new_token = sample_token_from_logits(logits, temperature, n_vocab, rng);
+            if (new_token < 0) {
+                return "";
+            }
+
+            if (new_token == eos_token || new_token == im_end_token) {
+                break;
+            }
+
+            char buf[256];
+            int len = llama_token_to_piece(vocab_, new_token, buf, sizeof(buf), 0, true);
+            if (len > 0) {
+                generated.append(buf, len);
+            }
+
+            ids.push_back(new_token);
+            n_gen++;
+        }
+        return generated;
+    }
+#endif
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 2048;
@@ -164,19 +306,6 @@ std::string TestToSpeech::run_llm(const std::string & text, const Options & opti
         fprintf(stderr, "TestToSpeech: failed to create llama context\n");
         return "";
     }
-
-    std::string normalized_text = normalize_tts_text(text);
-    std::string prompt = build_prompt(normalized_text);
-
-    std::vector<llama_token> tokens(prompt.size() + 32);
-    int n_tokens = llama_tokenize(vocab_, prompt.c_str(), prompt.size(),
-                                  tokens.data(), tokens.size(), true, true);
-    if (n_tokens < 0) {
-        fprintf(stderr, "TestToSpeech: tokenization failed\n");
-        llama_free(ctx);
-        return "";
-    }
-    tokens.resize(n_tokens);
 
     llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
     llama_sampler * sampler = llama_sampler_chain_init(chain_params);
@@ -396,6 +525,30 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
         profile.total_sec = std::chrono::duration<double>(t_total1 - t_total0).count();
         return ok;
     }
+
+#ifdef MIOTTS_HAS_ONNX
+    if (onnx_llm_) {
+        std::string token_text;
+        if (!generate_token_text(text, options, token_text)) {
+            return false;
+        }
+        std::vector<float> audio;
+        const auto t_codec0 = std::chrono::steady_clock::now();
+        if (!decode_tokens_to_audio(voice, token_text, audio, false)) {
+            return false;
+        }
+        const auto t_codec1 = std::chrono::steady_clock::now();
+        profile.codec_sec += std::chrono::duration<double>(t_codec1 - t_codec0).count();
+        profile.llm_tokens = static_cast<int>(parse_speech_tokens(token_text).size());
+        profile.decode_calls = 1;
+        profile.decoded_codes = static_cast<size_t>(profile.llm_tokens);
+
+        const bool ok = emit_range(audio, 0, audio.size(), true);
+        const auto t_total1 = std::chrono::steady_clock::now();
+        profile.total_sec = std::chrono::duration<double>(t_total1 - t_total0).count();
+        return ok;
+    }
+#endif
 
     if (!model_ || !vocab_) {
         fprintf(stderr, "TestToSpeech: LLM model is not loaded\n");

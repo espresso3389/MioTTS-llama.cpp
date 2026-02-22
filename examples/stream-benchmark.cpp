@@ -8,6 +8,8 @@
 
 struct args_t {
     std::string model_path;
+    std::string model_onnx_path;
+    std::string tokenizer_path;
     std::string codec_path;
     std::string codec_type = "ggml";
     std::string voice_path;
@@ -31,6 +33,8 @@ static void print_usage(const char * prog) {
         "\n"
         "Options:\n"
         "  -m, --model PATH        MioTTS LLM GGUF model path\n"
+        "  --model-onnx PATH       MioTTS LLM ONNX model path\n"
+        "  --tokenizer PATH        GGUF tokenizer model (required with --model-onnx)\n"
         "  -v, --voice PATH        Voice embedding (.emb.gguf or .bin)\n"
         "  -p, --prompt TEXT       Text to synthesize (use '-' for stdin)\n"
         "  -t, --temp FLOAT        Sampling temperature (default: 0.8)\n"
@@ -49,6 +53,12 @@ static bool parse_args(int argc, char ** argv, args_t & args) {
         if (arg == "-m" || arg == "--model") {
             if (++i >= argc) return false;
             args.model_path = argv[i];
+        } else if (arg == "--model-onnx") {
+            if (++i >= argc) return false;
+            args.model_onnx_path = argv[i];
+        } else if (arg == "--tokenizer") {
+            if (++i >= argc) return false;
+            args.tokenizer_path = argv[i];
         } else if (arg == "-gguf") {
             if (++i >= argc) return false;
             args.codec_path = argv[i];
@@ -115,6 +125,14 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "Error: -p is required\n");
         return 1;
     }
+    if (!args.model_path.empty() && !args.model_onnx_path.empty()) {
+        std::fprintf(stderr, "Error: use either -m/--model or --model-onnx, not both\n");
+        return 1;
+    }
+    if (!args.model_onnx_path.empty() && args.tokenizer_path.empty()) {
+        std::fprintf(stderr, "Error: --tokenizer is required with --model-onnx\n");
+        return 1;
+    }
     if (args.codec_path.empty()) {
         std::fprintf(stderr, "Error: codec path is required (-gguf or -onnx)\n");
         return 1;
@@ -124,10 +142,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    bool skip_llm = args.model_path.empty();
+    bool skip_llm = args.model_path.empty() && args.model_onnx_path.empty();
 
     TestToSpeech::Config cfg;
     cfg.model_path = args.model_path;
+    cfg.model_onnx_path = args.model_onnx_path;
+    cfg.tokenizer_path = args.tokenizer_path;
     cfg.codec_path = args.codec_path;
     cfg.codec_type = args.codec_type;
     cfg.n_threads = args.n_threads;
