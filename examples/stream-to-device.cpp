@@ -225,9 +225,6 @@ int main(int argc, char ** argv) {
 
     bool skip_llm = args.model_path.empty();
 
-    // This sample is intended to play audio, not print backend/model debug logs.
-    scoped_stderr_silencer silencer(true);
-
     TestToSpeech::Config cfg;
     cfg.model_path = args.model_path;
     cfg.codec_path = args.codec_path;
@@ -279,31 +276,37 @@ int main(int argc, char ** argv) {
     opt.max_tokens = args.max_tokens;
     opt.skip_llm = skip_llm;
 
-    const bool ok = tts.synthesize_stream(
-        voice,
-        args.prompt,
-        [&](const float * samples, size_t n_samples, int, bool is_last_chunk) -> bool {
-            std::unique_lock<std::mutex> lock(st.mu);
-            st.cv.wait(lock, [&]() {
-                return st.aborted || (st.queued_samples + n_samples <= st.max_queued_samples);
-            });
-            if (st.aborted) {
-                return false;
-            }
+    bool ok;
+    {
+        // Silence llama.cpp debug logs during inference.
+        scoped_stderr_silencer silencer(true);
 
-            if (samples && n_samples > 0) {
-                st.queue.insert(st.queue.end(), samples, samples + n_samples);
-                st.queued_samples += n_samples;
-            }
-            if (is_last_chunk) {
-                st.finished = true;
-            }
-            lock.unlock();
-            st.cv.notify_all();
-            return true;
-        },
-        args.chunk_samples,
-        opt);
+        ok = tts.synthesize_stream(
+            voice,
+            args.prompt,
+            [&](const float * samples, size_t n_samples, int, bool is_last_chunk) -> bool {
+                std::unique_lock<std::mutex> lock(st.mu);
+                st.cv.wait(lock, [&]() {
+                    return st.aborted || (st.queued_samples + n_samples <= st.max_queued_samples);
+                });
+                if (st.aborted) {
+                    return false;
+                }
+
+                if (samples && n_samples > 0) {
+                    st.queue.insert(st.queue.end(), samples, samples + n_samples);
+                    st.queued_samples += n_samples;
+                }
+                if (is_last_chunk) {
+                    st.finished = true;
+                }
+                lock.unlock();
+                st.cv.notify_all();
+                return true;
+            },
+            args.chunk_samples,
+            opt);
+    }
 
     {
         std::unique_lock<std::mutex> lock(st.mu);
@@ -313,7 +316,14 @@ int main(int argc, char ** argv) {
             st.finished = true;
         }
         st.cv.notify_all();
-        st.cv.wait(lock, [&]() { return st.aborted || (st.finished && st.queued_samples == 0); });
+        // Wait for queue to drain, but time out after 5s in case the audio
+        // callback isn't running (e.g. no audio device on WSL2).
+        if (!st.cv.wait_for(lock, std::chrono::seconds(5), [&]() {
+                return st.aborted || (st.finished && st.queued_samples == 0);
+            })) {
+            std::fprintf(stderr, "Warning: audio drain timed out (%zu samples remaining)\n",
+                         st.queued_samples);
+        }
     }
 
     ma_device_stop(&device);

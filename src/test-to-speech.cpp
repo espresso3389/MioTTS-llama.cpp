@@ -451,7 +451,6 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
         llama_free(ctx);
         return false;
     }
-
     llama_token eos_token = llama_vocab_eos(vocab_);
     llama_token im_end_token = -1;
     {

@@ -10,8 +10,7 @@ Also converts any .emb.gguf voice files in the output directory to .emb.bin
 (raw float32 binary) for use with the ONNX codec backend.
 
 Usage:
-    pip install miocodec torch onnx onnxruntime numpy gguf
-    python tools/export_miocodec_onnx.py
+    uv run python tools/export_miocodec_onnx.py
 
 Key ONNX-compatibility changes applied automatically:
 - RoPE: complex-number ops replaced with real-valued cos/sin

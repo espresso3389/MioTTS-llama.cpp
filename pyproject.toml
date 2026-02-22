@@ -1,0 +1,19 @@
+[project]
+name = "miotts-llama-cpp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gguf>=0.17.1",
+    "miocodec",
+    "numpy>=2.4.2",
+    "onnx>=1.20.1",
+    "onnxruntime>=1.24.2",
+    "soundfile>=0.13.1",
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+]
+
+[tool.uv.sources]
+miocodec = { git = "https://github.com/Aratako/MioCodec" }

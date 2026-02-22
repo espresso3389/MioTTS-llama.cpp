@@ -8,6 +8,7 @@ Built on [llama.cpp](https://github.com/ggerganov/llama.cpp) and [MioTTS](https:
 
 - A C++ compiler (GCC, Clang, or MSVC)
 - CMake 3.14+
+- [uv](https://docs.astral.sh/uv/)
 - ~600 MB disk space for the smallest model set
 
 ## Quick start
@@ -186,14 +187,12 @@ Use 5-30 seconds of mostly solo speech with low background noise.
 
 **For GGUF backend** (requires PyTorch):
 ```bash
-pip install miocodec torch torchaudio soundfile gguf
-python3 tools/create_voice_emb.py my_voice.wav models/my_voice.emb.gguf
+uv run tools/create_voice_emb.py my_voice.wav models/my_voice.emb.gguf
 ```
 
 **For ONNX backend** (lightweight, no PyTorch needed):
 ```bash
-pip install onnxruntime soundfile numpy
-python3 tools/create_voice_emb_onnx.py \
+uv run tools/create_voice_emb_onnx.py \
   --encoder miocodec_global_encoder.onnx \
   --audio my_voice.wav \
   --output models/my_voice.emb.bin
@@ -273,8 +272,7 @@ If ONNX Runtime is installed system-wide (e.g. via a package manager), it is aut
 3. Export the ONNX model files from [MioCodec-25Hz-24kHz](https://huggingface.co/Aratako/MioCodec-25Hz-24kHz):
 
 ```bash
-pip install miocodec torch onnx onnxruntime numpy gguf
-python3 tools/export_miocodec_onnx.py
+uv run tools/export_miocodec_onnx.py
 ```
 
 This single command downloads the model from HuggingFace, exports all three ONNX files to `models/`, and converts the built-in voice embeddings (`.emb.gguf` -> `.emb.bin`):
@@ -304,10 +302,10 @@ cmake --build build --target miotts-codec-benchmark
 
 ### `tools/export_miocodec_onnx.py`
 
-Export all MioCodec ONNX models and convert built-in voice embeddings in one command. Downloads MioCodec-25Hz-24kHz from HuggingFace automatically. Requires `miocodec`, `torch`, `onnx`, `onnxruntime`, `gguf`.
+Export all MioCodec ONNX models and convert built-in voice embeddings in one command. Downloads MioCodec-25Hz-24kHz from HuggingFace automatically.
 
 ```bash
-python3 tools/export_miocodec_onnx.py
+uv run tools/export_miocodec_onnx.py
 ```
 
 Use `--skip-encoders` to export only the decoder. Use `--output-dir` to change the output directory (default: `models/`).
@@ -317,8 +315,7 @@ Use `--skip-encoders` to export only the decoder. Use `--output-dir` to change t
 Extract a 128-dim voice embedding from a reference audio file using the ONNX global encoder. Produces a raw `.emb.bin` file for use with the ONNX codec backend.
 
 ```bash
-pip install onnxruntime soundfile numpy
-python3 tools/create_voice_emb_onnx.py \
+uv run tools/create_voice_emb_onnx.py \
   --encoder miocodec_global_encoder.onnx \
   --audio reference.wav \
   --output voice.emb.bin
@@ -329,8 +326,7 @@ python3 tools/create_voice_emb_onnx.py \
 Extract speech codes from an audio file using the ONNX content encoder. Outputs `<|s_N|>` formatted tokens for decode-only mode.
 
 ```bash
-pip install onnxruntime soundfile numpy
-python3 tools/extract_codes_onnx.py \
+uv run tools/extract_codes_onnx.py \
   --encoder miocodec_content_encoder.onnx \
   --audio input.wav \
   --output codes.txt
@@ -338,7 +334,7 @@ python3 tools/extract_codes_onnx.py \
 
 Or pipe directly into the decoder:
 ```bash
-python3 tools/extract_codes_onnx.py \
+uv run tools/extract_codes_onnx.py \
   --encoder miocodec_content_encoder.onnx \
   --audio input.wav \
   | ./build/miotts -onnx models/miocodec_decoder.onnx -v models/voice.emb.bin -p - -o output.wav

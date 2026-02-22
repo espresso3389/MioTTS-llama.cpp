@@ -467,7 +467,7 @@ miocodec_context * miocodec_load(const std::string & model_path) {
 
     ctx->resnet_blocks  = gguf_get_val_u32_or(g, "miocodec.resnet_blocks", 2);
     ctx->resnet_groups  = gguf_get_val_u32_or(g, "miocodec.resnet_groups", 32);
-    ctx->upsampler_stages = gguf_get_val_u32_or(g, "miocodec.wave_upsampler_layers", 2);
+    ctx->upsampler_stages = gguf_get_val_u32_or(g, "miocodec.wave_upsampler_layers", 0);
 
     ctx->rope_theta     = gguf_get_val_f32_or(g, "miocodec.rope_theta", 10000.0f);
     ctx->norm_eps       = gguf_get_val_f32_or(g, "miocodec.norm_eps", 1e-5f);
@@ -477,8 +477,10 @@ miocodec_context * miocodec_load(const std::string & model_path) {
     int n_up = ctx->upsampler_stages;
     ctx->up_factors.resize(n_up);
     ctx->up_kernels.resize(n_up);
-    read_tensor_data(ctx, "miocodec.wave_upsampler.factors", ctx->up_factors.data(), n_up * sizeof(int));
-    read_tensor_data(ctx, "miocodec.wave_upsampler.kernel_sizes", ctx->up_kernels.data(), n_up * sizeof(int));
+    if (n_up > 0) {
+        read_tensor_data(ctx, "miocodec.wave_upsampler.factors", ctx->up_factors.data(), n_up * sizeof(int));
+        read_tensor_data(ctx, "miocodec.wave_upsampler.kernel_sizes", ctx->up_kernels.data(), n_up * sizeof(int));
+    }
 
     // CPU backend
     ctx->backend = ggml_backend_cpu_init();
@@ -496,9 +498,11 @@ miocodec_context * miocodec_load(const std::string & model_path) {
             ctx->sample_rate, ctx->n_fft, ctx->hop_length, ctx->head_out_dim);
     fprintf(stderr, "miocodec: preloaded %.2f MiB tensor data into memory cache\n",
             (double) ctx->tensor_data_cache_bytes / (1024.0 * 1024.0));
-    fprintf(stderr, "miocodec: upsampler factors=[%d,%d] kernels=[%d,%d] total=%dx\n",
-            ctx->up_factors[0], ctx->up_factors[1],
-            ctx->up_kernels[0], ctx->up_kernels[1], total_up);
+    if (n_up > 0) {
+        fprintf(stderr, "miocodec: upsampler stages=%d total=%dx\n", n_up, total_up);
+    } else {
+        fprintf(stderr, "miocodec: no upsampler (S_final = S_dec)\n");
+    }
 
     return ctx;
 }
@@ -674,54 +678,59 @@ std::vector<float> miocodec_decode(
 
     // ---- 8. wave_upsampler stages ----
     // Python: wave_upsampler is applied AFTER wave_post, BEFORE istft_head
-    for (int stage = 0; stage < mctx->upsampler_stages; stage++) {
-        std::string p = "wave_upsampler.";
-        int factor = mctx->up_factors[stage];
-        int kernel = mctx->up_kernels[stage];
-        int trim_pad = (kernel - factor) / 2; // manual trim since ggml asserts p0==0
+    if (mctx->upsampler_stages > 0) {
+        for (int stage = 0; stage < mctx->upsampler_stages; stage++) {
+            std::string p = "wave_upsampler.";
+            int factor = mctx->up_factors[stage];
+            int kernel = mctx->up_kernels[stage];
+            int trim_pad = (kernel - factor) / 2; // manual trim since ggml asserts p0==0
 
-        // ConvTranspose1d (padding=0, then trim)
-        std::string up_name = p + "up." + std::to_string(stage);
-        x = ggml_conv_transpose_1d(ctx, W(up_name + ".weight"), x, factor, 0, 1);
-        x = add_conv_bias(ctx, x, W(up_name + ".bias"));
+            // ConvTranspose1d (padding=0, then trim)
+            std::string up_name = p + "up." + std::to_string(stage);
+            x = ggml_conv_transpose_1d(ctx, W(up_name + ".weight"), x, factor, 0, 1);
+            x = add_conv_bias(ctx, x, W(up_name + ".bias"));
 
-        // Trim excess from each side: out_raw = in*factor + (kernel-factor)
-        if (trim_pad > 0) {
-            int64_t raw_len = x->ne[0];
-            int64_t out_ch  = x->ne[1];
-            int64_t target  = raw_len - 2 * trim_pad;
-            x = ggml_view_2d(ctx, x, target, out_ch, x->nb[1],
-                             (size_t)trim_pad * x->nb[0]);
-            x = ggml_cont(ctx, x);
+            // Trim excess from each side: out_raw = in*factor + (kernel-factor)
+            if (trim_pad > 0) {
+                int64_t raw_len = x->ne[0];
+                int64_t out_ch  = x->ne[1];
+                int64_t target  = raw_len - 2 * trim_pad;
+                x = ggml_view_2d(ctx, x, target, out_ch, x->nb[1],
+                                 (size_t)trim_pad * x->nb[0]);
+                x = ggml_cont(ctx, x);
+            }
+            // Snake activation
+            std::string sn = p + "snake." + std::to_string(stage);
+            x = snake_activation(ctx, x, W(sn + ".alpha"), W(sn + ".beta"));
+            // ResNet block
+            std::string rb = p + "resblk." + std::to_string(stage) + ".";
+            x = resnet_block(ctx, x,
+                W(rb+"norm1.weight"), W(rb+"norm1.bias"),
+                W(rb+"conv1.weight"), W(rb+"conv1.bias"),
+                W(rb+"norm2.weight"), W(rb+"norm2.bias"),
+                W(rb+"conv2.weight"), W(rb+"conv2.bias"),
+                mctx->resnet_groups, gn_eps);
         }
-        // Snake activation
-        std::string sn = p + "snake." + std::to_string(stage);
-        x = snake_activation(ctx, x, W(sn + ".alpha"), W(sn + ".beta"));
-        // ResNet block
-        std::string rb = p + "resblk." + std::to_string(stage) + ".";
-        x = resnet_block(ctx, x,
-            W(rb+"norm1.weight"), W(rb+"norm1.bias"),
-            W(rb+"conv1.weight"), W(rb+"conv1.bias"),
-            W(rb+"norm2.weight"), W(rb+"norm2.bias"),
-            W(rb+"conv2.weight"), W(rb+"conv2.bias"),
-            mctx->resnet_groups, gn_eps);
-    }
-    // x: [S_final, 128] conv format
+        // x: [S_final, 128] conv format
 
-    // Upsampler output: transpose → Linear(128→512) → Snake (transformer format)
-    x = transpose2d(ctx, x); // [128, S_final]
-    x = linear(ctx, x, W("wave_upsampler.out_proj.weight"), W("wave_upsampler.out_proj.bias"));
-    // x: [512, S_final] transformer format
-    // out_snake: log-scale alpha/beta [512] — in transformer format ne[0]=512 matches alpha dim
-    // Formula: x + sin²(exp(alpha) * x) / exp(beta)
-    {
-        ggml_tensor * a = ggml_exp(ctx, W("wave_upsampler.out_snake.alpha"));
-        ggml_tensor * b = ggml_exp(ctx, W("wave_upsampler.out_snake.beta"));
-        ggml_tensor * ax = ggml_mul(ctx, x, a);
-        ggml_tensor * s  = ggml_sin(ctx, ax);
-        ggml_tensor * s2 = ggml_mul(ctx, s, s);
-        ggml_tensor * sc = ggml_div(ctx, s2, b);
-        x = ggml_add(ctx, x, sc);
+        // Upsampler output: transpose → Linear(128→512) → Snake (transformer format)
+        x = transpose2d(ctx, x); // [128, S_final]
+        x = linear(ctx, x, W("wave_upsampler.out_proj.weight"), W("wave_upsampler.out_proj.bias"));
+        // x: [512, S_final] transformer format
+        // out_snake: log-scale alpha/beta [512] — in transformer format ne[0]=512 matches alpha dim
+        // Formula: x + sin²(exp(alpha) * x) / exp(beta)
+        {
+            ggml_tensor * a = ggml_exp(ctx, W("wave_upsampler.out_snake.alpha"));
+            ggml_tensor * b = ggml_exp(ctx, W("wave_upsampler.out_snake.beta"));
+            ggml_tensor * ax = ggml_mul(ctx, x, a);
+            ggml_tensor * s  = ggml_sin(ctx, ax);
+            ggml_tensor * s2 = ggml_mul(ctx, s, s);
+            ggml_tensor * sc = ggml_div(ctx, s2, b);
+            x = ggml_add(ctx, x, sc);
+        }
+    } else {
+        // No upsampler: x is [S_dec, 512] conv format → transpose to transformer format
+        x = transpose2d(ctx, x); // [512, S_final]
     }
 
     // ---- 9. iSTFT head: Linear(512, 394) → mag + phase ----
