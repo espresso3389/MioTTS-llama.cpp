@@ -8,7 +8,7 @@ Downloads MioCodec-25Hz-24kHz from HuggingFace and exports three ONNX models:
 
 Usage:
     pip install miocodec torch onnx onnxruntime numpy
-    python scripts/export_miocodec_onnx.py --output-dir models/
+    python tools/export_miocodec_onnx.py --output-dir models/
 
 Key ONNX-compatibility changes applied automatically:
 - RoPE: complex-number ops replaced with real-valued cos/sin

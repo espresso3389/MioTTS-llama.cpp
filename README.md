@@ -41,7 +41,7 @@ For [mnga-o/miotts-cpp-gguf](https://huggingface.co/mmnga-o/miotts-cpp-gguf) ggu
 
 Download the required models (codec + all voices + default 0.1B LLM):
 ```bash
-./scripts/download-models.sh
+./tools/download-models.sh
 ```
 
 Windows PowerShell:
@@ -51,7 +51,7 @@ Windows PowerShell:
 
 Optional: download all MioTTS LLM models from `Aratako/MioTTS-GGUF`:
 ```bash
-./scripts/download-models.sh --all-models
+./tools/download-models.sh --all-models
 ```
 
 ```powershell
@@ -191,7 +191,7 @@ python3 tools/create_voice_emb.py my_voice.wav models/my_voice.emb.gguf
 **For ONNX backend** (lightweight, no PyTorch needed):
 ```bash
 pip install onnxruntime soundfile numpy
-python3 scripts/create_voice_emb_onnx.py \
+python3 tools/create_voice_emb_onnx.py \
   --encoder miocodec_global_encoder.onnx \
   --audio my_voice.wav \
   --output models/my_voice.emb.bin
@@ -270,7 +270,7 @@ cmake --build build
 
 ```bash
 pip install miocodec torch onnx onnxruntime numpy
-python3 scripts/export_miocodec_onnx.py --output-dir models/
+python3 tools/export_miocodec_onnx.py --output-dir models/
 ```
 
 This single command downloads the model from HuggingFace and exports all three ONNX files:
@@ -298,35 +298,35 @@ cmake --build build --target miotts-codec-benchmark
 
 ## Scripts
 
-### `scripts/export_miocodec_onnx.py`
+### `tools/export_miocodec_onnx.py`
 
 Export all MioCodec ONNX models (decoder + global encoder + content encoder) in one command. Downloads MioCodec-25Hz-24kHz from HuggingFace automatically. Requires `miocodec`, `torch`, `onnx`, `onnxruntime`.
 
 ```bash
-python3 scripts/export_miocodec_onnx.py --output-dir models/
+python3 tools/export_miocodec_onnx.py --output-dir models/
 ```
 
 Use `--skip-encoders` to export only the decoder.
 
-### `scripts/create_voice_emb_onnx.py`
+### `tools/create_voice_emb_onnx.py`
 
 Extract a 128-dim voice embedding from a reference audio file using the ONNX global encoder. Produces a raw `.emb.bin` file for use with the ONNX codec backend.
 
 ```bash
 pip install onnxruntime soundfile numpy
-python3 scripts/create_voice_emb_onnx.py \
+python3 tools/create_voice_emb_onnx.py \
   --encoder miocodec_global_encoder.onnx \
   --audio reference.wav \
   --output voice.emb.bin
 ```
 
-### `scripts/extract_codes_onnx.py`
+### `tools/extract_codes_onnx.py`
 
 Extract speech codes from an audio file using the ONNX content encoder. Outputs `<|s_N|>` formatted tokens for decode-only mode.
 
 ```bash
 pip install onnxruntime soundfile numpy
-python3 scripts/extract_codes_onnx.py \
+python3 tools/extract_codes_onnx.py \
   --encoder miocodec_content_encoder.onnx \
   --audio input.wav \
   --output codes.txt
@@ -334,7 +334,7 @@ python3 scripts/extract_codes_onnx.py \
 
 Or pipe directly into the decoder:
 ```bash
-python3 scripts/extract_codes_onnx.py \
+python3 tools/extract_codes_onnx.py \
   --encoder miocodec_content_encoder.onnx \
   --audio input.wav \
   | ./build/miotts -onnx models/miocodec_decoder.onnx -v models/voice.emb.bin -p - -o output.wav
