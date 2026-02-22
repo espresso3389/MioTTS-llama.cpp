@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Convert MioCodec decoder (wave mode) from safetensors to ONNX.
+"""Export MioCodec to ONNX (decoder + global encoder + content encoder).
 
-Exports the decode path: content_token_indices + global_embedding -> waveform.
-This is the component needed for MioTTS audio synthesis.
+Downloads MioCodec-25Hz-24kHz from HuggingFace and exports three ONNX models:
+  1. miocodec_decoder.onnx         - speech codes + voice -> waveform (required)
+  2. miocodec_global_encoder.onnx  - audio -> voice embedding (for voice cloning)
+  3. miocodec_content_encoder.onnx - audio -> speech codes (for testing)
 
-Key ONNX-compatibility changes:
-- RoPE: replaced complex-number operations with real-valued cos/sin
-- ISTFT: replaced torch.fft.irfft with precomputed iDFT matrix multiply
-- Overlap-add: replaced F.fold with ConvTranspose1d
+Usage:
+    pip install miocodec torch onnx onnxruntime numpy
+    python scripts/export_miocodec_onnx.py --output-dir models/
+
+Key ONNX-compatibility changes applied automatically:
+- RoPE: complex-number ops replaced with real-valued cos/sin
+- ISTFT: torch.fft.irfft replaced with precomputed iDFT matrix multiply
+- Overlap-add: F.fold replaced with ConvTranspose1d
 """
 
 import argparse
 import math
+import os
+import sys
 
 import numpy as np
-import onnx
-import onnxruntime as ort
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -171,8 +177,7 @@ class ISTFTHeadONNX(nn.Module):
         self.register_buffer("cos_basis", cos_basis * scale / n_fft)
         self.register_buffer("sin_basis", sin_basis * scale / n_fft)
 
-        # Overlap-add kernel: identity matrix as ConvTranspose1d weight
-        # (in_channels=win_length, out_channels=1, kernel_size=win_length)
+        # Overlap-add kernel
         ola_weight = torch.eye(win_length).unsqueeze(1)
         self.register_buffer("ola_weight", ola_weight)
 
@@ -183,29 +188,23 @@ class ISTFTHeadONNX(nn.Module):
     def forward(self, x):
         """x: (B, L, H) -> audio: (B, samples)"""
         x = self.out(x)
-        x = x.transpose(1, 2)  # (B, out_dim, T)
-        mag, phase = x.chunk(2, dim=1)  # each (B, freq_bins, T)
+        x = x.transpose(1, 2)
+        mag, phase = x.chunk(2, dim=1)
 
         mag = torch.clamp(torch.exp(mag), max=1e2)
         real = mag * torch.cos(phase)
         imag = mag * torch.sin(phase)
 
-        # iDFT: (n_fft, freq_bins) @ (B, freq_bins, T) -> (B, n_fft, T)
         ifft = self.cos_basis @ real - self.sin_basis @ imag
-
-        # Apply window
         ifft = ifft * self.window.unsqueeze(-1)
 
-        # Overlap-add via ConvTranspose1d: (B, win_length, T) -> (B, 1, output_len)
         y = F.conv_transpose1d(ifft, self.ola_weight, stride=self.hop_length).squeeze(1)
 
-        # Window envelope normalization
         T = ifft.shape[2]
         ones = torch.ones(1, self.win_length, T, device=x.device, dtype=x.dtype)
         envelope = F.conv_transpose1d(ones, self.env_weight, stride=self.hop_length).squeeze(1)
         y = y / (envelope + 1e-11)
 
-        # Trim padding
         if self.padding_mode == "same":
             pad = (self.win_length - self.hop_length) // 2
             y = y[:, pad:-pad]
@@ -217,20 +216,13 @@ class ISTFTHeadONNX(nn.Module):
 
 
 # ============================================================================
-# Main decoder wrapper
+# Decoder wrapper
 # ============================================================================
 
 class MioCodecDecoderONNX(nn.Module):
-    """ONNX-exportable MioCodec decoder (wave mode).
-
-    Inputs: content_token_indices (seq_len,), global_embedding (128,), stft_length (int)
-    Output: waveform (samples,)
-    """
-
     def __init__(self, model):
         super().__init__()
         assert model.config.use_wave_decoder
-
         self.local_quantizer = model.local_quantizer
         self.wave_prenet = TransformerONNX(model.wave_prenet)
         self.wave_decoder = TransformerONNX(model.wave_decoder)
@@ -242,34 +234,95 @@ class MioCodecDecoderONNX(nn.Module):
         self.wave_interpolation_mode = model.config.wave_interpolation_mode
 
     def forward(self, content_token_indices, global_embedding, stft_length):
-        # Decode tokens to embeddings
         content = self.local_quantizer.decode(content_token_indices.unsqueeze(0))
         global_emb = global_embedding.unsqueeze(0)
-
-        # Wave prenet
         x = self.wave_prenet(content)
-
-        # Conv upsample
         if self.wave_conv_upsample is not None:
             x = self.wave_conv_upsample(x.transpose(1, 2)).transpose(1, 2)
-
-        # Interpolate to STFT length
         x = F.interpolate(
             x.transpose(1, 2), size=stft_length, mode=self.wave_interpolation_mode
         ).transpose(1, 2)
-
-        # Prior ResNet -> Transformer -> Post ResNet
         x = self.wave_prior_net(x.transpose(1, 2)).transpose(1, 2)
         x = self.wave_decoder(x, condition=global_emb.unsqueeze(1))
         x = self.wave_post_net(x.transpose(1, 2)).transpose(1, 2)
-
-        # Optional upsampler
         if self.wave_upsampler is not None:
             x = self.wave_upsampler(x.transpose(1, 2))
-
-        # ISTFT
         waveform = self.istft_head(x)
         return waveform.squeeze(0)
+
+
+# ============================================================================
+# Encoder wrappers
+# ============================================================================
+
+class MioCodecGlobalEncoderONNX(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.ssl = model.ssl_feature_extractor
+        self.global_encoder = model.global_encoder
+        self.global_ssl_layers = model.global_ssl_layers
+
+    def forward(self, waveform):
+        wav = waveform.unsqueeze(0)
+        if self.ssl.resampler is not None:
+            wav = self.ssl.resampler(wav)
+        features, _ = self.ssl.model.extract_features(wav, num_layers=max(self.global_ssl_layers))
+        if len(self.global_ssl_layers) > 1:
+            selected = [features[i - 1] for i in self.global_ssl_layers]
+            global_feats = torch.stack(selected, dim=0).mean(dim=0)
+        else:
+            global_feats = features[self.global_ssl_layers[0] - 1]
+        return self.global_encoder(global_feats).squeeze(0)
+
+
+class MioCodecContentEncoderONNX(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.ssl = model.ssl_feature_extractor
+        self.local_encoder = TransformerONNX(model.local_encoder)
+        self.local_quantizer = model.local_quantizer
+        self.local_ssl_layers = model.local_ssl_layers
+        self.downsample_factor = model.config.downsample_factor
+        self.use_conv_downsample = model.config.use_conv_downsample
+        self.normalize_ssl = model.config.normalize_ssl_features
+        if self.use_conv_downsample:
+            self.conv_downsample = model.conv_downsample
+        self.sample_rate = model.config.sample_rate
+
+    def forward(self, waveform):
+        wav = waveform.unsqueeze(0)
+        audio_length = waveform.size(0)
+        num_samples_after = audio_length / self.sample_rate * self.ssl.ssl_sample_rate
+        expected_len = math.ceil(num_samples_after / self.ssl.hop_size)
+        num_required_after = self.ssl.get_minimum_input_length(expected_len)
+        num_required = num_required_after / self.ssl.ssl_sample_rate * self.sample_rate
+        padding = math.ceil((num_required - audio_length) / 2)
+        if padding > 0:
+            wav = F.pad(wav, (padding, padding), mode="constant")
+        if self.ssl.resampler is not None:
+            wav = self.ssl.resampler(wav)
+        features, _ = self.ssl.model.extract_features(wav, num_layers=max(self.local_ssl_layers))
+        if len(self.local_ssl_layers) > 1:
+            selected = [features[i - 1] for i in self.local_ssl_layers]
+            local_feats = torch.stack(selected, dim=0).mean(dim=0)
+        else:
+            local_feats = features[self.local_ssl_layers[0] - 1]
+        if self.normalize_ssl:
+            mean = torch.mean(local_feats, dim=1, keepdim=True)
+            std = torch.std(local_feats, dim=1, keepdim=True)
+            local_feats = (local_feats - mean) / (std + 1e-8)
+        local_encoded = self.local_encoder(local_feats)
+        if self.downsample_factor > 1:
+            if self.use_conv_downsample:
+                local_encoded = self.conv_downsample(local_encoded.transpose(1, 2)).transpose(1, 2)
+            else:
+                local_encoded = F.avg_pool1d(
+                    local_encoded.transpose(1, 2),
+                    kernel_size=self.downsample_factor,
+                    stride=self.downsample_factor,
+                ).transpose(1, 2)
+        _, indices = self.local_quantizer.encode(local_encoded)
+        return indices.squeeze(0)
 
 
 # ============================================================================
@@ -278,9 +331,7 @@ class MioCodecDecoderONNX(nn.Module):
 
 def calculate_stft_length(token_length, downsample_factor, ssl_hop_size,
                           ssl_sample_rate, sample_rate, hop_length, istft_padding):
-    """Calculate STFT frame count from token sequence length."""
     feature_length = token_length * downsample_factor
-    # Approximate get_minimum_input_length for wavlm_base_plus
     num_samples_ssl = (feature_length - 1) * ssl_hop_size + 400
     audio_length = math.ceil(num_samples_ssl / ssl_sample_rate * sample_rate)
     if istft_padding == "same":
@@ -289,31 +340,85 @@ def calculate_stft_length(token_length, downsample_factor, ssl_hop_size,
         return audio_length // hop_length + 1
 
 
+def export_and_verify(module, dummy_inputs, output_path, input_names, output_names,
+                      dynamic_axes, opset):
+    """Export module to ONNX, validate, and run ORT inference test."""
+    import onnx
+    import onnxruntime as ort
+
+    print(f"  Exporting (opset {opset})...")
+    torch.onnx.export(
+        module, dummy_inputs, output_path,
+        input_names=input_names, output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        opset_version=opset, do_constant_folding=True, dynamo=False,
+    )
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f"  Saved: {output_path} ({size_mb:.1f} MB)")
+
+    print("  Validating...")
+    onnx.checker.check_model(onnx.load(output_path))
+    print("  OK")
+
+    print("  ONNX Runtime test...")
+    sess = ort.InferenceSession(output_path)
+    feeds = {}
+    for name, inp in zip(input_names, dummy_inputs if isinstance(dummy_inputs, tuple) else (dummy_inputs,)):
+        if isinstance(inp, torch.Tensor):
+            feeds[name] = inp.numpy()
+        elif isinstance(inp, int):
+            feeds[name] = np.array(inp, dtype=np.int64)
+        else:
+            feeds[name] = np.array(inp)
+    ort_out = sess.run(None, feeds)[0]
+    print(f"  ORT output: {ort_out.shape}")
+    return ort_out
+
+
 # ============================================================================
 # Main
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert MioCodec decoder to ONNX")
-    parser.add_argument("--output", default="miocodec_decoder.onnx", help="Output ONNX path")
+    parser = argparse.ArgumentParser(
+        description="Export MioCodec to ONNX (decoder + global encoder + content encoder)"
+    )
+    parser.add_argument(
+        "--output-dir", default=".",
+        help="Output directory for ONNX files (default: current directory)",
+    )
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
-    parser.add_argument("--verify", action="store_true", help="Compare with original model")
-    parser.add_argument("--seq-len", type=int, default=50, help="Example sequence length")
+    parser.add_argument(
+        "--skip-encoders", action="store_true",
+        help="Only export decoder (skip global/content encoders)",
+    )
     args = parser.parse_args()
 
-    print("Loading MioCodec model...")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    decoder_path = os.path.join(args.output_dir, "miocodec_decoder.onnx")
+    global_path = os.path.join(args.output_dir, "miocodec_global_encoder.onnx")
+    content_path = os.path.join(args.output_dir, "miocodec_content_encoder.onnx")
+
+    # ---- Load model once ----
+    print("Loading MioCodec-25Hz-24kHz from HuggingFace...")
     from miocodec import MioCodecModel
     model = MioCodecModel.from_pretrained("Aratako/MioCodec-25Hz-24kHz")
     model.eval().cpu()
-    print(f"  use_wave_decoder={model.config.use_wave_decoder}, n_fft={model.config.n_fft}, hop={model.config.hop_length}")
+    print(f"  sample_rate={model.config.sample_rate}, n_fft={model.config.n_fft}, "
+          f"hop={model.config.hop_length}, wave_decoder={model.config.use_wave_decoder}")
 
-    print("Creating ONNX wrapper...")
+    # ---- 1. Decoder ----
+    print("\n" + "=" * 60)
+    print("1/3  Decoder: tokens + voice -> waveform")
+    print("=" * 60)
+
     decoder = MioCodecDecoderONNX(model)
     decoder.eval()
 
-    seq_len = args.seq_len
-    embed_dim = model.global_encoder.output_dim
+    seq_len = 50
     codebook_size = model.local_quantizer.all_codebook_size
+    embed_dim = model.global_encoder.output_dim
     dummy_tokens = torch.randint(0, codebook_size, (seq_len,), dtype=torch.long)
     dummy_global = torch.randn(embed_dim, dtype=torch.float32)
     stft_len = calculate_stft_length(
@@ -321,64 +426,96 @@ def main():
         model.ssl_feature_extractor.hop_size, model.ssl_feature_extractor.ssl_sample_rate,
         model.config.sample_rate, model.config.hop_length, model.config.istft_padding,
     )
-    print(f"  tokens={dummy_tokens.shape}, global={dummy_global.shape}, stft_len={stft_len}")
 
-    # Test PyTorch forward
-    print("PyTorch forward pass...")
+    print(f"  Test: {seq_len} tokens, embed_dim={embed_dim}, stft_len={stft_len}")
     with torch.no_grad():
         pt_out = decoder(dummy_tokens, dummy_global, stft_len)
-    print(f"  output: {pt_out.shape}")
+    print(f"  PyTorch output: {pt_out.shape}")
 
-    if args.verify:
-        print("Original model forward pass...")
-        with torch.no_grad():
-            emb = model.decode_token_indices(dummy_tokens.unsqueeze(0)).squeeze(0)
-            orig_out = model.decode(
-                global_embedding=dummy_global, content_embedding=emb,
-                target_audio_length=stft_len * model.config.hop_length,
-            )
-        print(f"  output: {orig_out.shape}")
-
-    # Export
-    print(f"Exporting ONNX (opset {args.opset})...")
-    torch.onnx.export(
+    ort_out = export_and_verify(
         decoder,
         (dummy_tokens, dummy_global, stft_len),
-        args.output,
+        decoder_path,
         input_names=["content_token_indices", "global_embedding", "stft_length"],
         output_names=["waveform"],
-        dynamic_axes={
-            "content_token_indices": {0: "seq_len"},
-            "waveform": {0: "samples"},
-        },
-        opset_version=args.opset,
-        do_constant_folding=True,
-        dynamo=False,
+        dynamic_axes={"content_token_indices": {0: "seq_len"}, "waveform": {0: "samples"}},
+        opset=args.opset,
     )
-    print(f"  Saved: {args.output}")
+    print(f"  Max diff (PyTorch vs ORT): {np.max(np.abs(pt_out.numpy() - ort_out)):.6e}")
 
-    # Validate
-    print("Validating...")
-    onnx_model = onnx.load(args.output)
-    onnx.checker.check_model(onnx_model)
-    print("  OK")
+    if args.skip_encoders:
+        print(f"\nDone! Decoder exported to {decoder_path}")
+        return
 
-    # ONNX Runtime test
-    print("ONNX Runtime inference...")
-    sess = ort.InferenceSession(args.output)
-    ort_out = sess.run(None, {
-        "content_token_indices": dummy_tokens.numpy(),
-        "global_embedding": dummy_global.numpy(),
-        "stft_length": np.array(stft_len, dtype=np.int64),
-    })[0]
-    print(f"  output: {ort_out.shape}")
-    print(f"  max diff (wrapper vs ORT): {np.max(np.abs(pt_out.numpy() - ort_out)):.6e}")
+    # ---- 2. Global Encoder ----
+    print("\n" + "=" * 60)
+    print("2/3  Global Encoder: audio -> voice embedding")
+    print("=" * 60)
 
-    if args.verify:
-        min_len = min(len(ort_out), len(orig_out))
-        print(f"  max diff (original vs ORT): {np.max(np.abs(orig_out.numpy()[:min_len] - ort_out[:min_len])):.6e}")
+    global_enc = MioCodecGlobalEncoderONNX(model)
+    global_enc.eval()
 
-    print("Done!")
+    dummy_wav = torch.randn(48000, dtype=torch.float32)  # 2 sec at 24kHz
+    print(f"  Test: {len(dummy_wav)} samples ({len(dummy_wav)/24000:.1f}s)")
+    with torch.no_grad():
+        pt_global = global_enc(dummy_wav)
+    print(f"  PyTorch output: {pt_global.shape}")
+
+    try:
+        ort_global = export_and_verify(
+            global_enc,
+            (dummy_wav,),
+            global_path,
+            input_names=["waveform"],
+            output_names=["global_embedding"],
+            dynamic_axes={"waveform": {0: "samples"}},
+            opset=args.opset,
+        )
+        print(f"  Max diff: {np.max(np.abs(pt_global.numpy() - ort_global)):.6e}")
+    except Exception as e:
+        print(f"  Export failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ---- 3. Content Encoder ----
+    print("\n" + "=" * 60)
+    print("3/3  Content Encoder: audio -> speech codes")
+    print("=" * 60)
+
+    content_enc = MioCodecContentEncoderONNX(model)
+    content_enc.eval()
+
+    print(f"  Test: {len(dummy_wav)} samples ({len(dummy_wav)/24000:.1f}s)")
+    with torch.no_grad():
+        pt_tokens = content_enc(dummy_wav)
+    print(f"  PyTorch output: {pt_tokens.shape}, range [{pt_tokens.min()}, {pt_tokens.max()}]")
+
+    try:
+        ort_tokens = export_and_verify(
+            content_enc,
+            (dummy_wav,),
+            content_path,
+            input_names=["waveform"],
+            output_names=["content_token_indices"],
+            dynamic_axes={"waveform": {0: "samples"}, "content_token_indices": {0: "seq_len"}},
+            opset=args.opset,
+        )
+        print(f"  Tokens match: {np.array_equal(pt_tokens.numpy(), ort_tokens)}")
+    except Exception as e:
+        print(f"  Export failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # ---- Summary ----
+    print("\n" + "=" * 60)
+    print("Export complete!")
+    print("=" * 60)
+    for path in [decoder_path, global_path, content_path]:
+        if os.path.isfile(path):
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            print(f"  {path} ({size_mb:.1f} MB)")
+        else:
+            print(f"  {path} (FAILED)")
 
 
 if __name__ == "__main__":

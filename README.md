@@ -270,15 +270,10 @@ cmake --build build
 
 ```bash
 pip install miocodec torch onnx onnxruntime numpy
-
-# Export decoder (tokens + voice embedding -> waveform)
-python3 scripts/export_miocodec_decoder_onnx.py --output miocodec_decoder.onnx --verify
-
-# Export encoders (waveform -> voice embedding / speech codes)
-python3 scripts/export_miocodec_encoder_onnx.py --verify
+python3 scripts/export_miocodec_onnx.py --output-dir models/
 ```
 
-This produces three files:
+This single command downloads the model from HuggingFace and exports all three ONNX files:
 
 | File | Size | Description |
 |------|------|-------------|
@@ -286,9 +281,9 @@ This produces three files:
 | `miocodec_global_encoder.onnx` | ~112 MB | Audio -> 128-dim voice embedding (for `create_voice_emb_onnx.py`) |
 | `miocodec_content_encoder.onnx` | ~447 MB | Audio -> speech codes (for `extract_codes_onnx.py`, testing) |
 
-Only the decoder is needed at runtime. The encoders are helper tools for preparing voice embeddings and extracting speech codes from reference audio.
+Only the decoder is needed at runtime. To export just the decoder: `--skip-encoders`.
 
-The export scripts handle ONNX compatibility issues automatically (RoPE with real-valued ops, iDFT via matrix multiply, overlap-add via ConvTranspose1d).
+The export handles ONNX compatibility issues automatically (RoPE with real-valued ops, iDFT via matrix multiply, overlap-add via ConvTranspose1d).
 
 ### Codec benchmark
 
@@ -303,23 +298,15 @@ cmake --build build --target miotts-codec-benchmark
 
 ## Scripts
 
-### `scripts/export_miocodec_decoder_onnx.py`
+### `scripts/export_miocodec_onnx.py`
 
-Export the MioCodec decoder from PyTorch to ONNX. Requires `miocodec`, `torch`, `onnx`, `onnxruntime`.
-
-```bash
-python3 scripts/export_miocodec_decoder_onnx.py --output miocodec_decoder.onnx --verify
-```
-
-### `scripts/export_miocodec_encoder_onnx.py`
-
-Export the MioCodec global encoder and content encoder from PyTorch to ONNX. Imports from `export_miocodec_decoder_onnx.py` (must be in the same directory).
+Export all MioCodec ONNX models (decoder + global encoder + content encoder) in one command. Downloads MioCodec-25Hz-24kHz from HuggingFace automatically. Requires `miocodec`, `torch`, `onnx`, `onnxruntime`.
 
 ```bash
-python3 scripts/export_miocodec_encoder_onnx.py --verify
+python3 scripts/export_miocodec_onnx.py --output-dir models/
 ```
 
-Outputs `miocodec_global_encoder.onnx` and `miocodec_content_encoder.onnx`.
+Use `--skip-encoders` to export only the decoder.
 
 ### `scripts/create_voice_emb_onnx.py`
 
