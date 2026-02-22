@@ -813,7 +813,33 @@ std::vector<float> miocodec_decode(
 // Voice embedding loader
 // ============================================================
 
+static bool ends_with(const std::string & s, const std::string & suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 std::vector<float> load_voice_embedding(const std::string & path) {
+    // Raw binary format: 128 float32 values (512 bytes)
+    if (ends_with(path, ".bin")) {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f.is_open()) {
+            fprintf(stderr, "voice_emb: failed to open %s\n", path.c_str());
+            return {};
+        }
+        auto file_size = f.tellg();
+        f.seekg(0);
+        int n = static_cast<int>(file_size / sizeof(float));
+        if (n <= 0) {
+            fprintf(stderr, "voice_emb: empty file %s\n", path.c_str());
+            return {};
+        }
+        std::vector<float> emb(n);
+        f.read(reinterpret_cast<char *>(emb.data()), n * sizeof(float));
+        fprintf(stderr, "voice_emb: loaded %d-dim from %s (raw binary)\n", n, path.c_str());
+        return emb;
+    }
+
+    // GGUF format
     ggml_context * meta = nullptr;
     gguf_init_params params = { true, &meta };
     gguf_context * gctx = gguf_init_from_file(path.c_str(), params);

@@ -13,92 +13,93 @@ set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/llama.cpp)
 
+# Optional ONNX Runtime codec backend
+option(MIOTTS_ONNX "Enable ONNX Runtime codec backend" OFF)
+
+set(MIOTTS_ONNX_SOURCES "")
+set(MIOTTS_ONNX_INCLUDE_DIRS "")
+set(MIOTTS_ONNX_LIBRARIES "")
+set(MIOTTS_ONNX_DEFINITIONS "")
+
+if(MIOTTS_ONNX)
+    # Allow user to specify ONNXRUNTIME_DIR for custom install location
+    find_library(ONNXRUNTIME_LIB onnxruntime
+        HINTS ${ONNXRUNTIME_DIR}/lib
+        REQUIRED)
+    find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h
+        HINTS ${ONNXRUNTIME_DIR}/include
+        PATH_SUFFIXES onnxruntime
+        REQUIRED)
+
+    message(STATUS "ONNX Runtime library: ${ONNXRUNTIME_LIB}")
+    message(STATUS "ONNX Runtime include: ${ONNXRUNTIME_INCLUDE}")
+
+    set(MIOTTS_ONNX_SOURCES src/codec-backend-onnx.cpp)
+    set(MIOTTS_ONNX_INCLUDE_DIRS ${ONNXRUNTIME_INCLUDE})
+    set(MIOTTS_ONNX_LIBRARIES ${ONNXRUNTIME_LIB})
+    set(MIOTTS_ONNX_DEFINITIONS MIOTTS_HAS_ONNX)
+endif()
+
+# Common source files
+set(MIOTTS_COMMON_SOURCES
+    src/miocodec.cpp
+    src/istft.cpp
+    src/text-normalize.cpp
+    src/test-to-speech.cpp
+    src/token-parser.cpp
+    src/wav-writer.cpp
+    ${MIOTTS_ONNX_SOURCES}
+)
+
+# Helper function to configure targets with common settings
+function(miotts_configure_target target)
+    target_include_directories(${target} PRIVATE
+        src
+        third_party/llama.cpp/include
+        third_party/llama.cpp/ggml/include
+        ${MIOTTS_ONNX_INCLUDE_DIRS}
+        ${ARGN}
+    )
+    target_link_libraries(${target} PRIVATE
+        llama
+        ggml
+        m
+        ${MIOTTS_ONNX_LIBRARIES}
+    )
+    if(MIOTTS_ONNX_DEFINITIONS)
+        target_compile_definitions(${target} PRIVATE ${MIOTTS_ONNX_DEFINITIONS})
+    endif()
+endfunction()
+
 # miotts executable
 add_executable(miotts
     src/main.cpp
-    src/miocodec.cpp
-    src/istft.cpp
-    src/text-normalize.cpp
-    src/test-to-speech.cpp
-    src/token-parser.cpp
-    src/wav-writer.cpp
+    ${MIOTTS_COMMON_SOURCES}
 )
-
-target_include_directories(miotts PRIVATE
-    src
-    third_party/llama.cpp/include
-    third_party/llama.cpp/ggml/include
-)
-
-target_link_libraries(miotts PRIVATE
-    llama
-    ggml
-    m
-)
+miotts_configure_target(miotts)
 
 add_executable(miotts-stream-device
     examples/stream-to-device.cpp
-    src/miocodec.cpp
-    src/istft.cpp
-    src/text-normalize.cpp
-    src/test-to-speech.cpp
-    src/token-parser.cpp
-    src/wav-writer.cpp
+    ${MIOTTS_COMMON_SOURCES}
 )
-
-target_include_directories(miotts-stream-device PRIVATE
-    src
-    third_party/llama.cpp/include
-    third_party/llama.cpp/ggml/include
+miotts_configure_target(miotts-stream-device
     third_party/llama.cpp/vendor/miniaudio
-)
-
-target_link_libraries(miotts-stream-device PRIVATE
-    llama
-    ggml
-    m
 )
 
 add_executable(miotts-stream-benchmark
     examples/stream-benchmark.cpp
-    src/miocodec.cpp
-    src/istft.cpp
-    src/text-normalize.cpp
-    src/test-to-speech.cpp
-    src/token-parser.cpp
-    src/wav-writer.cpp
+    ${MIOTTS_COMMON_SOURCES}
 )
-
-target_include_directories(miotts-stream-benchmark PRIVATE
-    src
-    third_party/llama.cpp/include
-    third_party/llama.cpp/ggml/include
-)
-
-target_link_libraries(miotts-stream-benchmark PRIVATE
-    llama
-    ggml
-    m
-)
+miotts_configure_target(miotts-stream-benchmark)
 
 add_executable(miotts-stream-compare
     examples/stream-compare.cpp
-    src/miocodec.cpp
-    src/istft.cpp
-    src/text-normalize.cpp
-    src/test-to-speech.cpp
-    src/token-parser.cpp
-    src/wav-writer.cpp
+    ${MIOTTS_COMMON_SOURCES}
 )
+miotts_configure_target(miotts-stream-compare)
 
-target_include_directories(miotts-stream-compare PRIVATE
-    src
-    third_party/llama.cpp/include
-    third_party/llama.cpp/ggml/include
+add_executable(miotts-codec-benchmark
+    examples/codec-benchmark.cpp
+    ${MIOTTS_COMMON_SOURCES}
 )
-
-target_link_libraries(miotts-stream-compare PRIVATE
-    llama
-    ggml
-    m
-)
+miotts_configure_target(miotts-codec-benchmark)

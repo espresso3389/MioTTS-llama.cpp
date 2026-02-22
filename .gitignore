@@ -11,3 +11,5 @@ compile_commands.json
 *.wav
 *.webm
 *.mp4
+
+*.log

@@ -3,11 +3,14 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
+#include <sstream>
 #include <string>
 
 struct miotts_params {
     std::string model_path;
     std::string codec_path;
+    std::string codec_type = "ggml"; // "ggml" or "onnx"
     std::string voice_path;
     std::string output_path = "output.wav";
     std::string text;
@@ -18,28 +21,41 @@ struct miotts_params {
     int n_gpu_layers = 0;
 
     bool dump_tensors = false;
-    bool skip_llm = false;
+    bool tokens_only = false;
 };
 
 static void print_usage(const char * prog) {
     fprintf(stderr,
             "Usage: %s [options]\n"
             "\n"
+            "Modes:\n"
+            "  1) Text-to-speech:  -m llm.gguf -gguf/-onnx codec -v voice -p \"text\"\n"
+            "  2) Tokens-only:     -m llm.gguf --tokens-only -p \"text\" (no codec needed)\n"
+            "  3) Decode-only:     -gguf/-onnx codec -v voice -p \"<|s_N|>...\"\n"
+            "\n"
+            "Codec backend:\n"
+            "  -gguf PATH             MioCodec GGUF model (44.1kHz)\n"
+            "  -onnx PATH             MioCodec ONNX decoder (24kHz)\n"
+            "\n"
             "Options:\n"
-            "  -m, --model PATH       MioTTS LLM GGUF model path (required unless --skip-llm)\n"
-            "  -c, --codec PATH       MioCodec GGUF model path (required)\n"
-            "  -v, --voice PATH       Voice embedding .emb.gguf path (required)\n"
+            "  -m, --model PATH       MioTTS LLM GGUF model path\n"
+            "  -v, --voice PATH       Voice embedding (.emb.gguf or .bin)\n"
             "  -o, --output PATH      Output WAV file path (default: output.wav)\n"
-            "  -p, --prompt TEXT      Text to synthesize (required)\n"
+            "  -p, --prompt TEXT      Text to synthesize (use '-' to read from stdin)\n"
             "  -t, --temp FLOAT       Sampling temperature (default: 0.8)\n"
             "  --max-tokens N         Max tokens to generate (default: 700)\n"
             "  --threads N            Number of CPU threads (default: 4)\n"
             "  -ngl N                 Number of GPU layers (default: 0)\n"
+            "  --tokens-only          Only run LLM, print tokens to stdout\n"
             "  --dump-tensors         Print MioCodec tensor names and exit\n"
-            "  --skip-llm             Treat --prompt as raw <|s_N|> token text\n"
             "  -h, --help             Show this help\n"
+            "\n"
+            "Examples:\n"
+            "  %s -m llm.gguf -onnx decoder.onnx -v voice.bin -p \"hello\"\n"
+            "  %s -m llm.gguf --tokens-only -p \"hello\" > tokens.txt\n"
+            "  %s -onnx decoder.onnx -v voice.bin -p - < tokens.txt\n"
             "\n",
-            prog);
+            prog, prog, prog, prog);
 }
 
 static bool parse_args(int argc, char ** argv, miotts_params & params) {
@@ -49,9 +65,20 @@ static bool parse_args(int argc, char ** argv, miotts_params & params) {
         if (arg == "-m" || arg == "--model") {
             if (++i >= argc) return false;
             params.model_path = argv[i];
+        } else if (arg == "-gguf") {
+            if (++i >= argc) return false;
+            params.codec_path = argv[i];
+            params.codec_type = "ggml";
+        } else if (arg == "-onnx") {
+            if (++i >= argc) return false;
+            params.codec_path = argv[i];
+            params.codec_type = "onnx";
         } else if (arg == "-c" || arg == "--codec") {
             if (++i >= argc) return false;
             params.codec_path = argv[i];
+        } else if (arg == "--codec-type") {
+            if (++i >= argc) return false;
+            params.codec_type = argv[i];
         } else if (arg == "-v" || arg == "--voice") {
             if (++i >= argc) return false;
             params.voice_path = argv[i];
@@ -75,8 +102,10 @@ static bool parse_args(int argc, char ** argv, miotts_params & params) {
             params.n_gpu_layers = std::stoi(argv[i]);
         } else if (arg == "--dump-tensors") {
             params.dump_tensors = true;
+        } else if (arg == "--tokens-only") {
+            params.tokens_only = true;
         } else if (arg == "--skip-llm") {
-            params.skip_llm = true;
+            // kept for backward compat, no-op (auto-detected from -m absence)
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             std::exit(0);
@@ -96,9 +125,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Read prompt from stdin if "-p -"
+    if (params.text == "-") {
+        std::ostringstream ss;
+        ss << std::cin.rdbuf();
+        params.text = ss.str();
+        // Strip trailing newline(s)
+        while (!params.text.empty() && (params.text.back() == '\n' || params.text.back() == '\r')) {
+            params.text.pop_back();
+        }
+    }
+
     if (params.dump_tensors) {
         if (params.codec_path.empty()) {
-            fprintf(stderr, "Error: --codec path required for --dump-tensors\n");
+            fprintf(stderr, "Error: codec path required for --dump-tensors\n");
             return 1;
         }
         miocodec_print_tensors(params.codec_path);
@@ -106,25 +146,61 @@ int main(int argc, char ** argv) {
     }
 
     if (params.text.empty()) {
-        fprintf(stderr, "Error: --prompt is required\n");
+        fprintf(stderr, "Error: -p is required\n");
         return 1;
     }
+
+    // --tokens-only: just run LLM and print tokens to stdout
+    if (params.tokens_only) {
+        if (params.model_path.empty()) {
+            fprintf(stderr, "Error: -m is required for --tokens-only\n");
+            return 1;
+        }
+
+        TestToSpeech::Config cfg;
+        cfg.model_path = params.model_path;
+        cfg.n_threads = params.n_threads;
+        cfg.n_gpu_layers = params.n_gpu_layers;
+        cfg.temperature = params.temperature;
+        cfg.max_tokens = params.max_tokens;
+
+        TestToSpeech tts(cfg);
+        if (!tts.is_ready()) {
+            fprintf(stderr, "Error: failed to initialize TestToSpeech\n");
+            return 1;
+        }
+
+        TestToSpeech::Options opt;
+        opt.temperature = params.temperature;
+        opt.max_tokens = params.max_tokens;
+
+        std::string token_text;
+        if (!tts.generate_token_text(params.text, opt, token_text)) {
+            fprintf(stderr, "Error: token generation failed\n");
+            return 1;
+        }
+
+        // Print to stdout (all logs go to stderr)
+        printf("%s\n", token_text.c_str());
+        return 0;
+    }
+
+    // Decode mode: codec + voice required
     if (params.codec_path.empty()) {
-        fprintf(stderr, "Error: --codec path is required\n");
+        fprintf(stderr, "Error: codec path is required (-gguf or -onnx)\n");
         return 1;
     }
     if (params.voice_path.empty()) {
-        fprintf(stderr, "Error: --voice path is required\n");
+        fprintf(stderr, "Error: -v is required\n");
         return 1;
     }
-    if (!params.skip_llm && params.model_path.empty()) {
-        fprintf(stderr, "Error: --model path is required (or use --skip-llm)\n");
-        return 1;
-    }
+
+    bool skip_llm = params.model_path.empty();
 
     TestToSpeech::Config cfg;
     cfg.model_path = params.model_path;
     cfg.codec_path = params.codec_path;
+    cfg.codec_type = params.codec_type;
     cfg.n_threads = params.n_threads;
     cfg.n_gpu_layers = params.n_gpu_layers;
     cfg.temperature = params.temperature;
@@ -145,7 +221,7 @@ int main(int argc, char ** argv) {
     TestToSpeech::Options opt;
     opt.temperature = params.temperature;
     opt.max_tokens = params.max_tokens;
-    opt.skip_llm = params.skip_llm;
+    opt.skip_llm = skip_llm;
 
     if (!tts.synthesize_to_file(voice, params.text, params.output_path, opt)) {
         fprintf(stderr, "Error: synthesis failed\n");

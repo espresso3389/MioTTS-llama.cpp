@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-class istft_cache;
+class CodecBackend;
 
 class VoiceModel {
 public:
@@ -40,6 +40,7 @@ public:
     struct Config {
         std::string model_path;
         std::string codec_path;
+        std::string codec_type = "ggml"; // "ggml" or "onnx"
         int n_threads = 4;
         int n_gpu_layers = 0;
         float temperature = 0.8f;
@@ -114,10 +115,7 @@ private:
     Config config_;
     struct llama_model * model_ = nullptr;
     const struct llama_vocab * vocab_ = nullptr;
-    struct miocodec_context * codec_ = nullptr;
+    std::unique_ptr<CodecBackend> codec_;
     int sample_rate_ = 0;
-    int n_fft_ = 0;
-    int hop_length_ = 0;
     int samples_per_token_ = 0;
-    std::unique_ptr<istft_cache> istft_cache_;
 };

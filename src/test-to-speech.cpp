@@ -1,7 +1,10 @@
 #include "test-to-speech.h"
 
-#include "istft.h"
-#include "miocodec.h"
+#include "codec-backend.h"
+#include "codec-backend-ggml.h"
+#ifdef MIOTTS_HAS_ONNX
+#include "codec-backend-onnx.h"
+#endif
 #include "text-normalize.h"
 #include "token-parser.h"
 #include "wav-writer.h"
@@ -54,24 +57,35 @@ TestToSpeech::TestToSpeech(const Config & config) : config_(config) {
         vocab_ = llama_model_get_vocab(model_);
     }
 
-    codec_ = miocodec_load(config_.codec_path);
-    if (!codec_) {
-        fprintf(stderr, "TestToSpeech: failed to load codec: %s\n", config_.codec_path.c_str());
-        return;
-    }
+    if (!config_.codec_path.empty()) {
+        if (config_.codec_type == "onnx") {
+#ifdef MIOTTS_HAS_ONNX
+            auto backend = std::make_unique<OnnxCodecBackend>(config_.codec_path);
+            if (!backend->is_valid()) {
+                fprintf(stderr, "TestToSpeech: failed to load ONNX codec: %s\n", config_.codec_path.c_str());
+                return;
+            }
+            codec_ = std::move(backend);
+#else
+            fprintf(stderr, "TestToSpeech: ONNX support not compiled in (build with -DMIOTTS_ONNX=ON)\n");
+            return;
+#endif
+        } else {
+            auto backend = std::make_unique<GgmlCodecBackend>(config_.codec_path);
+            if (!backend->is_valid()) {
+                fprintf(stderr, "TestToSpeech: failed to load GGML codec: %s\n", config_.codec_path.c_str());
+                return;
+            }
+            codec_ = std::move(backend);
+        }
 
-    sample_rate_ = miocodec_sample_rate(codec_);
-    n_fft_ = miocodec_n_fft(codec_);
-    hop_length_ = miocodec_hop_length(codec_);
-    samples_per_token_ = miocodec_samples_per_token(codec_);
-    istft_cache_ = std::make_unique<istft_cache>(n_fft_, n_fft_);
+        sample_rate_ = codec_->sample_rate();
+        samples_per_token_ = codec_->samples_per_token();
+    }
 }
 
 TestToSpeech::~TestToSpeech() {
-    if (codec_) {
-        miocodec_free(codec_);
-        codec_ = nullptr;
-    }
+    codec_.reset();
     if (model_) {
         llama_model_free(model_);
         model_ = nullptr;
@@ -80,7 +94,47 @@ TestToSpeech::~TestToSpeech() {
 }
 
 bool TestToSpeech::is_ready() const {
-    return codec_ != nullptr;
+    return model_ != nullptr || codec_ != nullptr;
+}
+
+// Helper: decode codes to audio via CodecBackend with optional timing.
+static bool decode_codes_via_backend(CodecBackend & backend,
+                                     const std::vector<float> & voice_emb,
+                                     const int * codes, int n_codes,
+                                     std::vector<float> & out_audio,
+                                     double * out_decode_sec = nullptr,
+                                     bool apply_peak_normalization = true) {
+    if (n_codes <= 0) {
+        out_audio.clear();
+        return true;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = backend.decode_to_audio(codes, n_codes, voice_emb.data(), out_audio);
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (!ok) {
+        fprintf(stderr, "TestToSpeech: codec decode failed\n");
+        return false;
+    }
+    if (out_decode_sec) {
+        *out_decode_sec += std::chrono::duration<double>(t1 - t0).count();
+    }
+
+    if (apply_peak_normalization) {
+        float peak = 0.0f;
+        for (float s : out_audio) {
+            peak = std::max(peak, std::abs(s));
+        }
+        if (peak > 1e-8f) {
+            float gain = 0.95f / peak;
+            for (float & s : out_audio) {
+                s *= gain;
+            }
+        }
+    }
+
+    return true;
 }
 
 int TestToSpeech::sample_rate() const {
@@ -213,93 +267,9 @@ bool TestToSpeech::decode_tokens_to_audio(const VoiceModel & voice,
         return false;
     }
 
-    int n_frames = 0;
-    int audio_length = static_cast<int>(codes.size()) * samples_per_token_;
-    std::vector<float> spec = miocodec_decode(
-        codec_, codes.data(), static_cast<int>(codes.size()),
-        voice.embedding().data(), audio_length, &n_frames);
-    if (spec.empty()) {
-        fprintf(stderr, "TestToSpeech: codec decode failed\n");
-        return false;
-    }
-
-    out_audio = istft(spec.data(), n_frames, hop_length_, *istft_cache_);
-    if (out_audio.empty()) {
-        fprintf(stderr, "TestToSpeech: iSTFT failed\n");
-        return false;
-    }
-
-    if (apply_peak_normalization) {
-        float peak = 0.0f;
-        for (float s : out_audio) {
-            peak = std::max(peak, std::abs(s));
-        }
-        if (peak > 1e-8f) {
-            float gain = 0.95f / peak;
-            for (float & s : out_audio) {
-                s *= gain;
-            }
-        }
-    }
-
-    return true;
-}
-
-static bool decode_codes_to_audio(miocodec_context * codec,
-                                  const std::vector<float> & voice_emb,
-                                  int samples_per_token,
-                                  int hop_length,
-                                  const istft_cache & istft_ctx,
-                                  const int * codes,
-                                  int n_codes,
-                                  std::vector<float> & out_audio,
-                                  double * out_codec_sec = nullptr,
-                                  double * out_istft_sec = nullptr,
-                                  bool apply_peak_normalization = true) {
-    if (n_codes <= 0) {
-        out_audio.clear();
-        return true;
-    }
-
-    int n_frames = 0;
-    int audio_length = n_codes * samples_per_token;
-    const auto t_codec0 = std::chrono::steady_clock::now();
-    std::vector<float> spec = miocodec_decode(
-        codec, codes, n_codes, voice_emb.data(), audio_length, &n_frames);
-    const auto t_codec1 = std::chrono::steady_clock::now();
-    if (spec.empty()) {
-        fprintf(stderr, "TestToSpeech: codec decode failed (stream)\n");
-        return false;
-    }
-    if (out_codec_sec) {
-        *out_codec_sec += std::chrono::duration<double>(t_codec1 - t_codec0).count();
-    }
-
-    const auto t_istft0 = std::chrono::steady_clock::now();
-    out_audio = istft(spec.data(), n_frames, hop_length, istft_ctx);
-    const auto t_istft1 = std::chrono::steady_clock::now();
-    if (out_audio.empty()) {
-        fprintf(stderr, "TestToSpeech: iSTFT failed (stream)\n");
-        return false;
-    }
-    if (out_istft_sec) {
-        *out_istft_sec += std::chrono::duration<double>(t_istft1 - t_istft0).count();
-    }
-
-    if (apply_peak_normalization) {
-        float peak = 0.0f;
-        for (float s : out_audio) {
-            peak = std::max(peak, std::abs(s));
-        }
-        if (peak > 1e-8f) {
-            float gain = 0.95f / peak;
-            for (float & s : out_audio) {
-                s *= gain;
-            }
-        }
-    }
-
-    return true;
+    return decode_codes_via_backend(*codec_, voice.embedding(),
+                                    codes.data(), static_cast<int>(codes.size()),
+                                    out_audio, nullptr, apply_peak_normalization);
 }
 
 bool TestToSpeech::synthesize_to_vector(const VoiceModel & voice,
@@ -529,23 +499,17 @@ bool TestToSpeech::synthesize_stream_profiled(const VoiceModel & voice,
         const int window_n_codes = static_cast<int>(codes.size());
 
         std::vector<float> window_audio;
-        double codec_sec = 0.0;
-        double istft_sec = 0.0;
-        if (!decode_codes_to_audio(codec_,
-                                   voice.embedding(),
-                                   samples_per_token_,
-                                   hop_length_,
-                                   *istft_cache_,
-                                   codes.data(),
-                                   window_n_codes,
-                                   window_audio,
-                                   &codec_sec,
-                                   &istft_sec,
-                                   false)) {
+        double decode_sec = 0.0;
+        if (!decode_codes_via_backend(*codec_,
+                                      voice.embedding(),
+                                      codes.data(),
+                                      window_n_codes,
+                                      window_audio,
+                                      &decode_sec,
+                                      false)) {
             return false;
         }
-        profile.codec_sec += codec_sec;
-        profile.istft_sec += istft_sec;
+        profile.codec_sec += decode_sec;
         profile.decode_calls++;
         profile.decoded_codes += (size_t) window_n_codes;
 
